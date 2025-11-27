@@ -1,0 +1,71 @@
+# ===========================================
+# SAM2Rad Training Configuration (Phase-1)
+# Using: SAM-ViT-H + LoRA (attention-only)
+# Single-class bone segmentation
+# ===========================================
+
+model:
+  sam_type: "vit_h"
+  sam_checkpoint: "/home/ds/Desktop/sam_hand/sam_hand/sam_vit_h_4b8939.pth"
+
+  # Freeze encoder except LoRA patches
+  freeze_encoder: true
+
+  # LoRA settings
+  use_lora: true
+  lora_rank: 8
+  lora_targets:
+    - "image_encoder.blocks.*.attn.qkv"
+    - "image_encoder.blocks.*.attn.proj"
+
+  # Mask decoder MUST be trainable
+  train_mask_decoder: true
+
+  # PPN settings
+  ppn:
+    enabled: true
+    hidden_dim: 256
+    num_layers: 3
+
+data:
+  train_image_dir: "/home/ds/Desktop/sam_hand/sam_hand/dataset/train"
+  train_ann_path:  "/home/ds/Desktop/sam_hand/sam_hand/dataset/train/US_hand_train_coco.json"
+
+  val_image_dir:   "/home/ds/Desktop/sam_hand/sam_hand/dataset/val"
+  val_ann_path:    "/home/ds/Desktop/sam_hand/sam_hand/dataset/val/US_hand_val_coco.json"
+
+  num_classes: 1         # single-class (bone)
+  image_size: 1024       # SAM default
+  grayscale_to_rgb: true # repeat 1→3 channel
+
+  augmentations:
+    flip: true
+    brightness: true
+    contrast: true
+    gaussian_noise: true
+    affine_scale: true
+
+training:
+  batch_size: 2
+  num_epochs: 100
+
+  lr:
+    lora: 2.0e-4
+    mask_decoder: 1.0e-4
+    ppn: 1.0e-3
+
+  weight_decay: 0.0001
+  warmup_steps: 1000
+  lr_schedule: "cosine"
+
+  num_workers: 4
+  device: "cuda"
+
+losses:
+  mask_loss: "dice_focal"
+  ppn_loss: "bce"
+  iou_loss: true
+
+save:
+  output_dir: "checkpoints_sam2rad/"
+  save_every: 5
