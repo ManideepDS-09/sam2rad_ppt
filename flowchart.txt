@@ -1,0 +1,99 @@
+                 [COCO JSON]                     [PNG / JPG]
+                       │                               │
+                       │                               │
+                       ▼                               ▼
+               ┌────────────────┐               ┌───────────────┐
+               │  Annotation    │               │   Image        │
+               │  polygons →    │               │   (gray)       │
+               │  binary mask   │               └───────────────┘
+               └────────┬───────┘                        │
+                        │                                 │
+                        ▼                                 ▼
+                 [GT Mask Tensor]                [Convert Gray→RGB]
+                        │                                 │
+                        │                                 ▼
+                        │                       Resize to 1024×1024
+                        │                                 │
+                        └──────────────┬──────────────────┘
+                                       ▼
+                          ┌─────────────────────────┐
+                          │   SAM2RadModel.forward  │
+                          └─────────────────────────┘
+                                       │
+                         (model receives **image only**)
+                                       │
+                                       ▼
+   ┌───────────────────────────────────────────────────────────────────────┐
+   │                           1) SAM IMAGE ENCODER                        │
+   │                                                                       │
+   │  images (B,3,1024,1024) ──────────────────► ViT-H CNN/Transformer     │
+   │                                              (frozen except LoRA)     │
+   │                                                                       │
+   │  Output: feats (B,256,H/16,W/16)  ←──────── image embeddings          │
+   └───────────────────────────────────────────────────────────────────────┘
+
+                                       │
+                                       ▼
+   ┌───────────────────────────────────────────────────────────────────────┐
+   │                          2) PPN POINT PREDICTOR                       │
+   │                                                                       │
+   │   feats (B,256,h,w) ─────────────► small CNN → (B,7,3)                │
+   │                                        │        │                     │
+   │                     coords (x,y) ◄─────┘        └────► logits (fg/bg) │
+   │                                                                       │
+   │   pred_coords: (B,7,2)                                                │
+   │   pred_labels: (B,7)  (0/1)                                           │
+   └───────────────────────────────────────────────────────────────────────┘
+
+                                       │
+                        (PPN outputs become SAM prompts)
+                                       │
+                                       ▼
+
+   ┌───────────────────────────────────────────────────────────────────────┐
+   │                          3) SAM PROMPT ENCODER                        │
+   │                                                                       │
+   │   Inputs: pred_coords + pred_labels                                   │
+   │                                                                       │
+   │   prompt_encoder(points=(coords, labels)) →                           │
+   │                sparse_emb, dense_emb                                  │
+   └───────────────────────────────────────────────────────────────────────┘
+
+                                       │
+                                       ▼
+
+   ┌───────────────────────────────────────────────────────────────────────┐
+   │                            4) SAM MASK DECODER                        │
+   │                                                                       │
+   │   mask_decoder(image_embeddings=feats,                                │
+   │                sparse_prompt_embeddings=sparse_emb,                   │
+   │                dense_prompt_embeddings=dense_emb)                     │
+   │                                                                       │
+   │                 ▼                               ▼                    │
+   │         mask_logits (B,1,256,256)         iou_pred (B,1)              │
+   └───────────────────────────────────────────────────────────────────────┘
+
+                                       │
+                                       ▼
+   ┌───────────────────────────────────────────────────────────────────────┐
+   │                       5) LOSS CALCULATION                             │
+   │                                                                       │
+   │   Mask Loss = Dice + Focal                                           │
+   │   Coord Loss = SmoothL1( pred_coords , gt_ppn_coords )               │
+   │   Label Loss = BCE( pred_labels , gt_ppn_labels )                    │
+   │                                                                       │
+   │   Total Loss = w1 * mask + w2 * coord + w3 * label                   │
+   └───────────────────────────────────────────────────────────────────────┘
+
+                                       │
+                                       ▼
+
+   ┌───────────────────────────────────────────────────────────────────────┐
+   │                           6) BACKPROP                                 │
+   │          Gradients flow into BOTH:                                    │
+   │          - SAM LoRA layers                                             │
+   │          - SAM Mask Decoder                                            │
+   │          - PPN                                                         │
+   │                                                                       │
+   │         (BIG NOTE: ViT-H encoder stays frozen except LoRA)            │
+   └───────────────────────────────────────────────────────────────────────┘

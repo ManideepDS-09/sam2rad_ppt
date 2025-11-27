@@ -1,0 +1,2 @@
+LoRA rank = 8
+and 7 points

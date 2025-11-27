@@ -1,0 +1,90 @@
+1) configs/sam2rad.yaml
+Describes:
+model paths
+LoRA rank
+freeze rules
+PPN config PPN (Prompt Prediction Network)
+losses
+dataset folders
+training hyperparameters (done)
+
+2) training_sam.py
+Main orchestrator:
+loads YAML
+builds SAM-ViT-H backbone
+injects LoRA
+builds PPN
+loads dataset
+sets optimizer
+handles training loop
+saves checkpoints
+
+3) data.py
+Contains:
+DICOM/PNG readers
+augmentations (flip, noise, CLAHE, blur)
+mask encoding
+point/box prompt generation
+US-specific normalization (done)
+
+4) sam_backbone.py
+Here we patch SAM-ViT-H:
+load SAM weights
+freeze base encoder layers
+insert LoRA into:
+patch_embed.proj
+image_encoder.blocks.*.attn.qkv
+make mask decoder trainable
+forward() returns mask logits + embeddings (done)
+
+5) ppn.py
+Implements Prompt Prediction Network:
+small CNN or transformer
+takes image embeddings
+predicts:
+foreground point
+background point
+optional bounding box
+outputs tokens compatible with prompt encoder
+
+6) losses.py
+Includes:
+mask loss (dice + BCE)
+IoU loss
+PPN point regression loss
+PPN box regression loss
+multi-output combined loss
+
+total_loss = 
+      mask_loss        (Dice + Focal/BCE)
+    + ppn_point_loss   (regression)
+    + ppn_label_loss   (classification)
+
+This total loss back-propagates into:
+LoRA encoder
+PPN head
+SAM decoder
+Everything that requires_grad to adjust the weights
+
+
+Note ----->  This is basically instance segmentation, not true semantic multi-class segmentation.
+
+Image
+  ↓
+SAM Image Encoder
+  ↓ img_features
+PPN ---------------------------------------------------------------
+  ↓ predicted points (x,y)
+SAM Prompt Encoder → 256-dim embeddings
+  ↓
+SAM Mask Decoder
+  ↓ predicted mask
+Losses compare predicted mask → ground truth annotations
+Backprop
+
+
+
+
+
+
+

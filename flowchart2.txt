@@ -1,0 +1,94 @@
+                      TRAINING EXAMPLE
+────────────────────────────────────────────────────────────
+              Example Image (1024×1024)  
+              Ground Truth Mask from COCO  
+────────────────────────────────────────────────────────────
+
+STEP 1 — Preprocessing
+────────────────────────────────────────────────────────────
+Gray → RGB
+Resize → 1024×1024
+To Tensor [3,1024,1024]
+────────────────────────────────────────────────────────────
+
+STEP 2 — SAM IMAGE ENCODER  (Frozen except LoRA)
+────────────────────────────────────────────────────────────
+IMAGE ─────► ViT-H Transformer
+            (32 transformer layers)
+            (patch embeddings)
+            (self-attention across whole image)
+
+Output:
+IMAGE EMBEDDINGS = [256 × 64 × 64]
+
+These are the "meaning maps" of the image.
+────────────────────────────────────────────────────────────
+
+STEP 3 — PPN Point Prediction
+────────────────────────────────────────────────────────────
+PPN CNN takes the 256×64×64 embeddings:
+
+EMBEDDINGS ─────► PPN  ─────► 7 predicted points:
+                 (ConvNet)  
+                                       ┌──────────────┐
+pred_coords:  [7, 2 normalized]  ─────►│(x,y) per pt  │
+pred_labels:  [7, 1] logits     ─────►│FG/BG class    │
+                                       └──────────────┘
+
+These 7 points = prompts for SAM.
+────────────────────────────────────────────────────────────
+
+STEP 4 — SAM PROMPT ENCODER
+────────────────────────────────────────────────────────────
+(pred_coords, pred_labels) ─────► prompt_encoder()
+
+Returns:
+   sparse_emb  (point embeddings)
+   dense_emb   (mask/rich embeddings)
+────────────────────────────────────────────────────────────
+
+STEP 5 — SAM MASK DECODER
+────────────────────────────────────────────────────────────
+(image_embeddings, sparse_emb, dense_emb) ─────► mask_decoder()
+
+Returns:
+    mask_logits [1 × 256 × 256]
+    iou_pred    confidence score
+────────────────────────────────────────────────────────────
+
+STEP 6 — LOSSES  (3 losses used)
+────────────────────────────────────────────────────────────
+Mask Loss:
+    Dice + Focal on mask_logits vs GT mask
+
+Coord Loss:
+    SmoothL1(pred_coords, gt_coords)
+
+Label Loss:
+    BCE(pred_labels, gt_labels)
+
+FINAL TOTAL LOSS = weighted sum
+────────────────────────────────────────────────────────────
+
+STEP 7 — BACKPROP (THE IMPORTANT PART)
+────────────────────────────────────────────────────────────
+Gradient flows into:
+   ✓ PPN (always)
+   ✓ SAM Mask Decoder  (trainable)
+   ✓ LoRA weights in Encoder (trainable)
+But NOT into:
+   ✗ Rest of SAM ViT-H encoder (frozen)
+
+This means:
+   - PPN gets better at choosing correct points.
+   - Mask decoder gets better at turning hints into masks.
+   - LoRA learns ultrasound-specific patterns.
+────────────────────────────────────────────────────────────
+
+
+
+GRADIENT FLOW (the important final piece)
+LOSS  ─► PPN conv layers                   (train updates)
+      └► SAM mask decoder weights          (train updates)
+      └► LoRA layers in SAM encoder        (train updates)
+      └► Frozen ViT-H backbone             (no update)
