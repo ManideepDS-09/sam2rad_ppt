@@ -1,4 +1,4 @@
-#read_dicom_sam.py
+# read_dicom_sam.py
 import os
 import torch
 import cv2
@@ -9,140 +9,270 @@ from torchvision.transforms.functional import to_tensor
 
 from sam2rad_model import SAM2RadModel
 
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# -----------------------
+from OR_auto_calculator import (
+    compute_OR_from_components,
+    MIN_COMP_AREA
+)
+
+# -------------------------------------------------
+# CLASS MAP (must match training)
+# -------------------------------------------------
+CLASS_MAP = {
+    0: "PD4",
+    1: "PD3",
+    2: "PD2",
+    3: "PD5",
+    4: "PM5",
+    5: "PM4",
+    6: "PM3",
+    7: "PM2",
+    8: "PP5",
+    9: "MC5",
+    10: "PP4",
+    11: "MC4",
+    12: "PP3",
+    13: "MC3",
+    14: "PP2",
+    15: "MC2",
+    16: "PD1",
+    17: "PP1",
+    18: "or",
+}
+
+# -------------------------------------------------
 # PATHS
-# -----------------------
+# -------------------------------------------------
 SAM_CKPT = "/home/ds/Desktop/sam_hand/sam_hand/sam_vit_h_4b8939.pth"
-RAD_CKPT = "/home/ds/Desktop/sam2rad_ppt/checkpoints_sam2rad/checkpoints/best_model.pth"
+RAD_CKPT = "/home/ds/Desktop/sam2rad_ppt/checkpoints_sam2rad/checkpoints/epoch_0009.pth"
 
 
-# -----------------------
-# Load SAM2Rad model
-# -----------------------
+# -------------------------------------------------
+# Load model
+# -------------------------------------------------
 def load_model():
-
     print("Loading SAM2Rad checkpoint...")
 
-    # Build model
     model = SAM2RadModel(
         sam_checkpoint=SAM_CKPT,
-        lora_rank=8
+        lora_rank=4
     )
 
-    # Load trained weights (PPN + LoRA)
     state = torch.load(RAD_CKPT, map_location="cpu")
-
     if "model" in state:
         state = state["model"]
 
-    # Remove DataParallel prefixes
-    clean_state = {}
-    for k, v in state.items():
-        nk = k.replace("module.", "")
-        clean_state[nk] = v
-
+    clean_state = {k.replace("module.", ""): v for k, v in state.items()}
     missing, unexpected = model.load_state_dict(clean_state, strict=False)
 
-    print("Loaded. Missing keys:", len(missing))
-    print("Unexpected keys:", len(unexpected))
+    print(f"Loaded checkpoint.")
+    print(f"Missing keys: {len(missing)}")
+    print(f"Unexpected keys: {len(unexpected)}")
+    print("Model ready.\n")
 
     model.eval()
     model.to(DEVICE)
     return model
 
 
-# -----------------------
-# Load specific DICOM frame
-# -----------------------
-def load_dicom_frame(dicom_path, frame_number):
+# -------------------------------------------------
+# DICOM Frame Loader
+# -------------------------------------------------
+def load_dicom_frame(dicom_path, frame_idx):
     ds = pydicom.dcmread(dicom_path)
-    arr = ds.pixel_array  # (F,H,W)
+    arr = ds.pixel_array
+    frame = arr[frame_idx]
 
-    frame = arr[frame_number]
-
-    # Normalize and convert to uint8
     frame = frame.astype(np.float32)
     frame -= frame.min()
-    frame /= frame.max()
+    frame /= max(frame.max(), 1e-5)
     frame = (frame * 255).astype(np.uint8)
-
     return frame
 
 
-# -----------------------
+# -------------------------------------------------
 # Preprocess for SAM2Rad
-# -----------------------
-def preprocess_frame(frame):
-
-    # Resize to 1024×1024
-    frame_resized = cv2.resize(frame, (1024, 1024))
-
+# -------------------------------------------------
+def preprocess_frame(frame_uint8):
+    frame_resized = cv2.resize(frame_uint8, (1024, 1024))
     rgb = cv2.cvtColor(frame_resized, cv2.COLOR_GRAY2RGB)
-
-    tensor = to_tensor(rgb).unsqueeze(0)  # [1,3,H,W]
-    return tensor.to(DEVICE), rgb
+    return to_tensor(rgb).unsqueeze(0).to(DEVICE), rgb
 
 
-# -----------------------
-# Inference + Visualization
-# -----------------------
-def run_inference(model, dicom_path, frame_number):
+# -------------------------------------------------
+# Inference + OR
+# -------------------------------------------------
+def run_inference(model, dicom_path, frame_idx, save_images=True):
 
-    frame = load_dicom_frame(dicom_path, frame_number)
+    frame = load_dicom_frame(dicom_path, frame_idx)
     tensor, rgb = preprocess_frame(frame)
 
     with torch.no_grad():
-        out = model(tensor)
+        out = model(tensor, num_bones=5)
+        pts = out["ppn_coords"]
+        max_pts = pts.shape[1]         # (7*N)
+        num_bones = max_pts // 7
+        if num_bones < 1:
+            num_bones = 1              # safety
+        out = model(tensor, num_bones=num_bones)
+    print(f"[INFERENCE] num_bones={num_bones}")
 
-    # Pred mask (256×256)
+    # logits 256×256
     pmask = out["mask_logits"].sigmoid()[0, 0].cpu().numpy()
+    # -----------------------------------------------------
+    # Phase-5: predicted bone class IDs
+    # -----------------------------------------------------
+    # shape (1, num_bones, num_classes) -> (num_bones,)
+    pred_logits = out["pred_class_logits"][0]  # (num_bones, 19)
+    pred_ids = pred_logits.argmax(-1).cpu().numpy()
 
-    # Upscale to 1024×1024
-    pmask_big = cv2.resize(pmask, (1024, 1024), interpolation=cv2.INTER_NEAREST)
+    # filter invalid IDs
+    pred_ids = [pid if (0 <= pid < len(CLASS_MAP)) else -1 for pid in pred_ids]
 
-    # PPN Points
-    coords = out["ppn_coords"][0].cpu().numpy()
-    H, W = 1024, 1024
-    px = (coords[:, 0] * W).astype(int)
-    py = (coords[:, 1] * H).astype(int)
+    bone_names = []
+    for pid in pred_ids:
+        if pid == -1:
+            bone_names.append("UNKNOWN")
+        else:
+            bone_names.append(CLASS_MAP[pid])
 
-    # Overlay mask
-    overlay = np.zeros((1024, 1024, 3), dtype=np.float32)
-    overlay[..., 1] = pmask_big  # green
+    print("\n===== CLASS PREDICTION DEBUG =====")
+    print("pred_ids:", pred_ids)
+    print("bone_names:", bone_names)
+    print("==================================\n")
+
+
+    # upscale to 1024
+    pmask_big = cv2.resize(
+        pmask, (1024, 1024),
+        interpolation=cv2.INTER_NEAREST
+    )
+
+    # ============================
+    # Prepare overlay at full size
+    # ============================
+    overlay = np.zeros((1024, 1024, 3), dtype=np.uint8)
+    overlay[..., 1] = pmask_big  # green channel shows mask
     overlay = (overlay * 255).astype(np.uint8)
 
-    # Plot
-    fig, ax = plt.subplots(1, 3, figsize=(18, 6))
 
-    ax[0].imshow(rgb, cmap="gray")
-    ax[0].scatter(px, py, c="yellow", s=40)
-    ax[0].set_title(f"Frame {frame_number}")
-
-    ax[1].imshow(pmask_big, cmap="gray")
-    ax[1].set_title("Predicted Mask")
-
-    ax[2].imshow(overlay)
-    ax[2].set_title("Overlay")
-
-    for a in ax:
-        a.axis("off")
-
-    out_path = f"output_frame_{frame_number:04d}.png"
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-
-    print(f"\nSaved: {out_path}\n")
+    # threshold (keep same threshold you chose earlier)
+    #bin_mask = (pmask_big > 0.5).astype(np.uint8)
+    #for thr in [0.25, 0.3, 0.35, 0.45, 0.55]:
+    for thr in [0.55,0.65,0.75,0.85]:
+        bin_mask = (pmask_big > thr).astype(np.uint8)
+        num,_ = cv2.connectedComponents(bin_mask)
+        print("threshold",thr,"→ components:",num-1)
 
 
-# -----------------------
+    # connected components
+    num_labels, lab = cv2.connectedComponents(bin_mask)
+
+    print("\n================== MASK DEBUG ==================")
+    print(f"Raw components from connectedComponents: {num_labels - 1}")
+
+    comps = []
+    for cid in range(1, num_labels):
+        comp = (lab == cid).astype(np.uint8)
+        area = int(comp.sum())
+
+        print(f" - comp {cid}: area={area}")
+
+        if area >= MIN_COMP_AREA:
+            print("   -> accepted as bone")
+            comps.append(comp)
+        else:
+            print("   -> rejected (small area)")
+
+        # ------------------------------------------
+        # Predict centroid and annotate bone name
+        # ------------------------------------------
+        ys, xs = np.where(comp > 0)
+        if len(xs) > 0:
+            cx = int(xs.mean())
+            cy = int(ys.mean())
+        else:
+            cx, cy = 0, 0
+
+        # bone index to read class for:
+        comp_idx = cid - 1  # cid=1 -> index0, cid=2 -> index1 ...
+
+        label_txt = bone_names[comp_idx] if comp_idx < len(bone_names) else "?"
+        cv2.putText(
+            overlay,  # use same overlay where yellow points appear OR define below
+            label_txt,
+            (cx, cy),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,                # scale
+            (0, 255, 255),      # yellow
+            2,                  # thickness
+            cv2.LINE_AA
+        )
+
+        print(f"   -> predicted name: {label_txt} @ ({cx},{cy})")
+
+
+    print(f"\nVALID bones passed to OR module: {len(comps)}")
+    print("================================================\n")
+
+    # OR calc (unchanged)
+    or_out = compute_OR_from_components(
+        comps=comps,
+        rgb=rgb,
+        out_path=f"output_or_1.png" if save_images else None
+    )
+
+    # PPN points for visualization
+    coords = out["ppn_coords"][0].cpu().numpy()
+    px = (coords[:, 0] * 1024).astype(int)
+    py = (coords[:, 1] * 1024).astype(int)
+
+    # prepare a blank RGB overlay at DICOM resolution
+    overlay = np.zeros((bin_mask.shape[0], bin_mask.shape[1], 3), dtype=np.uint8)
+    overlay[..., 1] = pmask_big
+    overlay = (overlay * 255).astype(np.uint8)
+
+    # Save only if enabled
+    if save_images:
+        fig, ax = plt.subplots(1, 3, figsize=(18, 6))
+
+        ax[0].imshow(rgb, cmap="gray")
+        ax[0].scatter(px, py, c="yellow", s=40)
+        ax[0].set_title(f"Frame {frame_idx}")
+
+        ax[1].imshow(pmask_big, cmap="gray")
+        ax[1].set_title("Predicted Mask")
+
+        ax[2].imshow(overlay)
+        ax[2].set_title("Overlay")
+
+        for a in ax:
+            a.axis("off")
+
+        out_path = f"output_frame_2.png"
+        plt.savefig(out_path, dpi=150)
+        plt.close()
+
+        print(f"Image saved: {out_path}")
+
+        if or_out and save_images:
+            print(f"OR Debug saved as output_or.png")
+
+    print("\n======== OR RESULTS ========")
+    for k, v in or_out.items():
+        print(f"{k}: {v}")
+    print("============================\n")
+
+    return or_out
+
+
+# -------------------------------------------------
 # MAIN
-# -----------------------
+# -------------------------------------------------
 if __name__ == "__main__":
-    DICOM_PATH = "/home/ds/Desktop/Hand_dicom/H006.dcm"
-    FRAME_NUM = 166
+    DICOM_PATH = "/home/ds/Desktop/Hand_dicom/K02.dcm"
+    FRAME     = 765
 
     model = load_model()
-    run_inference(model, DICOM_PATH, FRAME_NUM)
+    run_inference(model, DICOM_PATH, FRAME, save_images=True)

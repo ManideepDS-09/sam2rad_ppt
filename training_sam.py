@@ -46,57 +46,78 @@ def iou_score(pred, target, eps=1e-6):
 def save_sample_visual(model, val_loader, device, out_dir, epoch):
     core_model = model.module if isinstance(model, nn.DataParallel) else model
     core_model.eval()
+
     with torch.no_grad():
         for batch in val_loader:
-            img = batch["image"].to(device)   # (1,3,H,W)
+
+            img = batch["image"].to(device)
             masks = batch["masks"].to(device)
 
-            # ✔ pass num_bones to model
-            #N=len(batch["ppn_points"]) 
-            max_pts = batch["ppn_points"].shape[1]
+            # GT points
+            gt_pts = batch["ppn_points"][0].cpu().numpy()   # (max_pts, 2)
+            gt_labels = batch["ppn_labels"][0].cpu().numpy()
+
+            # number of bones = max_pts / 7
+            max_pts = gt_pts.shape[0]
             N = max_pts // 7
+
             out = core_model(img, num_bones=N)
 
+            # predicted mask
             pmask = out["mask_logits"].sigmoid()[0, 0].cpu().numpy()
 
-           #if masks.shape[0] > 0:
-           #    gmask = masks[0].cpu().numpy()
-           #    if gmask.ndim == 3:
-           #        gmask = gmask[0]
-           #else:
-           #    gmask = np.zeros_like(pmask)
-            gt_mask = (masks.sum(dim=1, keepdim=True) > 0).float()
+            gt_mask = masks.float()   # (B, N, H, W)
             gmask = gt_mask[0, 0].cpu().numpy()
 
-            # Resize pred mask to GT resolution
+            # resize pred mask
             H_gt, W_gt = gmask.shape
             pmask_big = cv2.resize(pmask, (W_gt, H_gt), interpolation=cv2.INTER_NEAREST)
 
-            # Overlay
-            overlay = np.zeros((H_gt, W_gt, 3), dtype=np.float32)
-            overlay[..., 0] = gmask
-            overlay[..., 1] = pmask_big
+            # predicted PPN coords
+            pred_coords = out["ppn_coords"][0].cpu().numpy()  # (7*N,2)
 
-            # PPN points
-            coords = out["ppn_coords"][0].cpu().numpy()
+            # map to pixel coords
             H, W = img.shape[2], img.shape[3]
-            px = (coords[:, 0] * W).astype(int)
-            py = (coords[:, 1] * H).astype(int)
+            px_pred = (pred_coords[:, 0] * W).astype(int)
+            py_pred = (pred_coords[:, 1] * H).astype(int)
 
-            fig, ax = plt.subplots(1, 4, figsize=(20, 5))
+            # GT mapped to pixel coords
+            px_gt = (gt_pts[:, 0] * W).astype(int)
+            py_gt = (gt_pts[:, 1] * H).astype(int)
 
+            # overlay masks
+            overlay = np.zeros((H_gt, W_gt, 3), dtype=np.float32)
+            overlay[..., 0] = gmask      # red = GT
+            overlay[..., 1] = pmask_big  # green = predicted
+
+            fig, ax = plt.subplots(1, 4, figsize=(22, 6))
+
+            # ---------------------------------------------------
+            # 1. Input image with GT red points + Pred yellow points
+            # ---------------------------------------------------
             ax[0].imshow(img[0].cpu().permute(1, 2, 0))
-            ax[0].scatter(px, py, c="yellow", s=40)
-            ax[0].set_title("Input + PPN")
+            ax[0].scatter(px_pred, py_pred, c="yellow", s=40, label="Pred")
+            ax[0].scatter(px_gt, py_gt, c="red", s=40, label="GT")
+            ax[0].legend(loc="lower right")
+            ax[0].set_title("Input + PPN (Pred=Yellow, GT=Red)")
 
+            # ---------------------------------------------------
+            # 2. predicted mask
+            # ---------------------------------------------------
             ax[1].imshow(pmask, cmap="gray")
             ax[1].set_title("Pred Mask")
 
+            # ---------------------------------------------------
+            # 3. GT mask
+            # ---------------------------------------------------
             ax[2].imshow(gmask, cmap="gray")
             ax[2].set_title("GT Mask")
 
+            # ---------------------------------------------------
+            # 4. Overlay
+            # ---------------------------------------------------
             ax[3].imshow(overlay)
-            ax[3].set_title("Overlay (Pred=Green, GT=Red)")
+            ax[3].set_title("Overlay (GT=Red, Pred=Green)")
 
             for a in ax:
                 a.axis("off")
@@ -107,21 +128,65 @@ def save_sample_visual(model, val_loader, device, out_dir, epoch):
             break
 
 def save_loss_plot(history, out_dir):
-    plt.title("Loss Breakdown Over Epochs")
-    plt.figure(figsize=(8, 5))
+
+    # ---------------------------
+    # 1. Total Loss (train + val)
+    # ---------------------------
+    plt.figure(figsize=(7, 5))
     plt.plot(history["train_total"], label="train_total")
     plt.plot(history["val_total"], label="val_total")
-    plt.plot(history["dice"], label="dice")
-    plt.plot(history["iou"], label="iou")
+    plt.grid(True)
+    plt.legend()
+    plt.title("Total Loss")
+    plt.savefig(os.path.join(out_dir, "loss_total.png"), dpi=150)
+    plt.close()
+
+    # ---------------------------
+    # 2. Mask Loss
+    # ---------------------------
+    plt.figure(figsize=(7, 5))
     plt.plot(history["train_mask"], label="train_mask")
     plt.plot(history["val_mask"], label="val_mask")
+    plt.grid(True)
+    plt.legend()
+    plt.title("Mask Loss")
+    plt.savefig(os.path.join(out_dir, "loss_mask.png"), dpi=150)
+    plt.close()
+
+    # ---------------------------
+    # 3. PPN Coord Loss
+    # ---------------------------
+    plt.figure(figsize=(7, 5))
     plt.plot(history["train_coord"], label="train_coord")
     plt.plot(history["val_coord"], label="val_coord")
+    plt.grid(True)
+    plt.legend()
+    plt.title("PPN Coord Loss")
+    plt.savefig(os.path.join(out_dir, "loss_coord.png"), dpi=150)
+    plt.close()
+
+    # ---------------------------
+    # 4. PPN Label Loss
+    # ---------------------------
+    plt.figure(figsize=(7, 5))
     plt.plot(history["train_label"], label="train_label")
     plt.plot(history["val_label"], label="val_label")
     plt.grid(True)
     plt.legend()
-    plt.savefig(os.path.join(out_dir, "loss_plot.png"), dpi=150)
+    plt.title("PPN Label Loss")
+    plt.savefig(os.path.join(out_dir, "loss_label.png"), dpi=150)
+    plt.close()
+
+    # ---------------------------
+    # 5. Metrics: Dice + IoU
+    # ---------------------------
+    plt.figure(figsize=(7, 5))
+    plt.plot(history["dice"], label="dice")
+    plt.plot(history["iou"], label="iou")
+    plt.grid(True)
+    plt.legend()
+    plt.title("Dice & IoU")
+    plt.savefig(os.path.join(out_dir, "metrics_dice_iou.png"), dpi=150)
     plt.close()
 
 # ================================================================
@@ -178,6 +243,8 @@ def train(cfg):
     # Folders
     # ----------------------------
     ckpt_dir = os.path.join(cfg["save"]["output_dir"], "checkpoints")
+    print("[DEBUG] checkpoint directory:", ckpt_dir)
+    print("[DEBUG] directory exists?", os.path.exists(ckpt_dir))
     sample_dir = os.path.join(cfg["save"]["output_dir"], "samples")
     log_dir = os.path.join(cfg["save"]["output_dir"], "logs")
     mkdir(ckpt_dir); mkdir(sample_dir); mkdir(log_dir)
@@ -186,7 +253,7 @@ def train(cfg):
     # Early stopping
     # ----------------------------
     best_val = float("inf")
-    patience = cfg["training"].get("patience", 10)
+    patience = cfg["training"].get("patience", 12)
     no_improve = 0
 
     history = {
@@ -218,17 +285,15 @@ def train(cfg):
             masks = batch["masks"].to(device)
            # merge all masks into a single binary mask
             # masks: (B, num_inst, H, W)
-            gt_mask = (masks.sum(dim=1, keepdim=True) > 0).float()
+            gt_mask = masks.float()   # (B, N, H, W)
 
 
             # -----------------------------------------------------
-            # ✔ MULTI-BONE PPN GT PREPARATION
+            #  MULTI-BONE PPN GT PREPARATION
             # -----------------------------------------------------
            #ppn_list = batch["ppn_points"]         # list of N tensors (7,2)
            #lbl_list = batch["ppn_labels"]         # list of N tensors (7,1)
-           #N = len(ppn_list)                      # number of bones
-
-            # flatten: (N,7,2) → (N*7,2)
+           #N = len(ppn_list)                      # number of bones flatten: (N,7,2) → (N*7,2)
            #gt_pts = torch.tensor(ppn_list).reshape(-1, 2).float().to(device)
            #gt_labels = torch.tensor(lbl_list).reshape(-1, 1).float().to(device)
 
@@ -240,7 +305,7 @@ def train(cfg):
 
             optimizer.zero_grad()
 
-            # ✔ pass number of bones to PPN
+            # pass number of bones to PPN
             out = model(img, num_bones=num_bones)
 
             
@@ -256,6 +321,22 @@ def train(cfg):
                 align_corners=False,
             )
 
+            print("pred_class_logits shape:", out["pred_class_logits"].shape)
+            print("gt_class_ids shape:", batch["class_ids"].shape)
+            # --------------------------
+            # MAP COCO class_ids → [0..18]
+            # keep -1 untouched
+            # --------------------------
+            gt_class_ids = batch["class_ids"].to(device)
+            gt_class_ids = torch.where(
+                gt_class_ids >= 0,
+                gt_class_ids - 1,
+                gt_class_ids
+            )
+
+            # Debug
+            print("gt_class_ids (final):", torch.unique(gt_class_ids))
+
             loss_dict = criterion(
                 pred_mask_logits,
                 gt_mask,
@@ -263,7 +344,10 @@ def train(cfg):
                 gt_pts,
                 pred_logits,
                 gt_labels,
+                out["pred_class_logits"],   # NEW
+                gt_class_ids,               # FIXED
             )
+
             mask_loss = loss_dict["mask_loss"].item()
             coord_loss = loss_dict["coord_loss"].item()
             label_loss = loss_dict["label_loss"].item()
@@ -301,9 +385,9 @@ def train(cfg):
             for batch in pbar_val:
                 img = batch["image"].to(device)
                 masks = batch["masks"].to(device)
-                gt_mask = (masks.sum(dim=1, keepdim=True) > 0).float()
+                gt_mask = masks.float()   # (B, N, H, W)
 
-                # ✔ MULTI-BONE GT for validation
+                # MULTI-BONE GT for validation
                 #pn_list = batch["ppn_points"]
                 #bl_list = batch["ppn_labels"]
                 # = len(ppn_list)
@@ -315,7 +399,7 @@ def train(cfg):
                 gt_labels = batch["ppn_labels"].to(device)
                 max_pts = gt_pts.shape[1]
                 num_bones = max_pts // 7
-                # ✔ pass num_bones
+                # pass num_bones
                 out = eval_model(img, num_bones=num_bones)
 
                 pred_mask_logits = out["mask_logits"]
@@ -330,14 +414,24 @@ def train(cfg):
                 pred_pts = out["ppn_coords"]
                 pred_logits = out["ppn_out"][:, :, 2:]
 
+                gt_class_ids = batch["class_ids"].to(device)
+                gt_class_ids = torch.where(
+                    gt_class_ids >= 0,
+                    gt_class_ids - 1,
+                    gt_class_ids
+                )
+
                 loss_dict = criterion(
-                    pmask,
+                    pred_mask_logits,
                     gt_mask,
                     pred_pts,
                     gt_pts,
                     pred_logits,
                     gt_labels,
+                    out["pred_class_logits"],
+                    gt_class_ids,
                 )
+
                 mask_loss = loss_dict["mask_loss"].item()
                 coord_loss = loss_dict["coord_loss"].item()
                 label_loss = loss_dict["label_loss"].item()
@@ -387,16 +481,44 @@ def train(cfg):
         # ============================
         # EARLY STOPPING
         # ============================
+        print("\n[DEBUG CHECKPOINT]")
+        print("val_total =", val_total, "   (type:", type(val_total), ")")
+        print("best_val BEFORE =", best_val)
+        print("val_total < best_val ?", val_total < best_val)
+        print("is NaN?", torch.isnan(torch.tensor(val_total)))
+        print("ckpt_dir =", ckpt_dir)
+        print("------------")
+
         if val_total < best_val:
             best_val = val_total
             no_improve = 0
-            torch.save(model.state_dict(), os.path.join(ckpt_dir, "best_model.pth"))
+            ckpt_path = os.path.join(ckpt_dir, "best_model.pth")
+            print("[DEBUG] ENTERED CHECKPOINT SAVE")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict()
+                },
+                ckpt_path
+            )
+            print("[DEBUG] best_val UPDATED TO:", best_val)
         else:
             no_improve += 1
 
         if no_improve >= patience:
             print("\nEarly stopping triggered.")
             break
+
+        # ----------------------------------
+        # LR adjust for SAM (LoRA parameters)
+        # ----------------------------------
+        if epoch == 10:
+            for pg in optimizer.param_groups:
+                # the LoRA group is group index 0
+                if pg["lr"] == cfg["training"]["lr"]["lora"]:
+                    old_lr = pg["lr"]
+                    pg["lr"] = old_lr * 0.33
+                    print(f"\n[LR UPDATE] Reduced LoRA LR from {old_lr} → {pg['lr']}\n")
 
         scheduler.step()
 

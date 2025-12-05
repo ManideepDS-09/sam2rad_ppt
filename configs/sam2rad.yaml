@@ -13,7 +13,7 @@ model:
 
   # LoRA settings
   use_lora: true
-  lora_rank: 8
+  lora_rank: 4
   lora_targets:
     - "image_encoder.blocks.*.attn.qkv"
     - "image_encoder.blocks.*.attn.proj"
@@ -67,5 +67,5 @@ losses:
   iou_loss: true
 
 save:
-  output_dir: "checkpoints_sam2rad/"
+  output_dir: "checkpoints_sam2rad_train_4/"
   save_every: 5

@@ -3,38 +3,32 @@ import json
 import cv2
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
 from torchvision.transforms.functional import to_tensor
 
 from sam2rad_model import SAM2RadModel
 
-# -----------------------------
-# Config paths
-# -----------------------------
+# --------------------------------------
+# Config
+# --------------------------------------
 TEST_IMG_DIR = "/home/ds/Desktop/sam_hand/sam_hand/dataset/test"
-TEST_JSON = "/home/ds/Desktop/sam_hand/sam_hand/dataset/test/US_hand_test_coco.json"
-CHECKPOINT = "/home/ds/Desktop/sam2rad_ppt/checkpoints_sam2rad/checkpoints/best_model.pth"
+TEST_JSON    = "/home/ds/Desktop/sam_hand/sam_hand/dataset/test/US_hand_test_coco.json"
+CHECKPOINT   = "/home/ds/Desktop/sam2rad_ppt/checkpoints_sam2rad/checkpoints/best_model.pth"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-OUT_DIR = "eval_outputs"
-os.makedirs(OUT_DIR, exist_ok=True)
 
-
-# --------------------------------------------------------
-# COCO Utilities
-# --------------------------------------------------------
-def load_coco_annotations(json_path):
-    with open(json_path, "r") as f:
+# --------------------------------------
+# COCO utilities
+# --------------------------------------
+def load_coco_annotations(path):
+    with open(path, "r") as f:
         coco = json.load(f)
 
     images = {img["id"]: img for img in coco["images"]}
-
     ann_map = {}
+
     for ann in coco["annotations"]:
         img_id = ann["image_id"]
-        if img_id not in ann_map:
-            ann_map[img_id] = []
-        ann_map[img_id].append(ann)
+        ann_map.setdefault(img_id, []).append(ann)
 
     return images, ann_map
 
@@ -42,7 +36,7 @@ def load_coco_annotations(json_path):
 def polygon_to_mask(segmentation, h, w):
     mask = np.zeros((h, w), dtype=np.uint8)
 
-    if isinstance(segmentation, list):
+    if isinstance(segmentation, list):   # polygon
         pts = np.array(segmentation[0]).reshape(-1, 2).astype(np.int32)
         cv2.fillPoly(mask, [pts], 1)
     else:
@@ -52,139 +46,138 @@ def polygon_to_mask(segmentation, h, w):
     return mask
 
 
-# --------------------------------------------------------
-# Load the trained model
-# --------------------------------------------------------
+# --------------------------------------
+# Load trained SAM2Rad model
+# --------------------------------------
 def load_trained_model():
-    print("Loading trained SAM2Rad model...")
+    print("Loading SAM2Rad model for evaluation...")
 
-    # Build model
     model = SAM2RadModel(
         sam_checkpoint="/home/ds/Desktop/sam_hand/sam_hand/sam_vit_h_4b8939.pth",
-        lora_rank=8
+        lora_rank=4
     )
 
-    # Load checkpoint
     ckpt = torch.load(CHECKPOINT, map_location="cpu")
     state = ckpt["model"] if "model" in ckpt else ckpt
 
-    clean_state = {k.replace("module.", ""): v for k, v in state.items()}
+    clean = {k.replace("module.", ""): v for k, v in state.items()}
+    model.load_state_dict(clean, strict=True)
 
-    model.load_state_dict(clean_state, strict=True)
     model.to(DEVICE)
     model.eval()
-
-    print("Model loaded successfully.\n")
+    print("Done.\n")
     return model
 
 
-# --------------------------------------------------------
-# Dice / IoU metrics
-# --------------------------------------------------------
+# --------------------------------------
+# Metrics
+# --------------------------------------
 def dice(pred, gt):
-    pred = (pred > 0.5).astype(np.float32)
-    gt = (gt > 0.5).astype(np.float32)
-    inter = (pred * gt).sum()
-    return (2*inter) / (pred.sum() + gt.sum() + 1e-6)
+    p = (pred > 0.5).astype(np.float32)
+    g = (gt > 0.5).astype(np.float32)
+    inter = (p * g).sum()
+    return (2 * inter) / (p.sum() + g.sum() + 1e-6)
 
 
 def iou(pred, gt):
-    pred = (pred > 0.5).astype(np.float32)
-    gt = (gt > 0.5).astype(np.float32)
-    inter = (pred * gt).sum()
-    union = pred.sum() + gt.sum() - inter
+    p = (pred > 0.5).astype(np.float32)
+    g = (gt > 0.5).astype(np.float32)
+    inter = (p * g).sum()
+    union = p.sum() + g.sum() - inter
     return inter / (union + 1e-6)
 
 
-# --------------------------------------------------------
-# Run model on test set
-# --------------------------------------------------------
+# --------------------------------------
+# Evaluation loop
+# --------------------------------------
 def evaluate(model):
+
     images, ann_map = load_coco_annotations(TEST_JSON)
 
-    dice_scores = []
-    iou_scores = []
+    # class-wise accumulators
+    class_dice = {}
+    class_iou  = {}
+    class_count = {}
 
-    for img_id, img_info in images.items():
+    # Loop over test images
+    for img_id, info in images.items():
 
-        fname = img_info["file_name"]
-        path = os.path.join(TEST_IMG_DIR, fname)
+        fname = info["file_name"]
+        img_path = os.path.join(TEST_IMG_DIR, fname)
 
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        # extract joint name from filename before "_"
+        joint_name = fname.split("_")[0]
+
+        # prepare buckets
+        class_dice.setdefault(joint_name, [])
+        class_iou.setdefault(joint_name, [])
+        class_count.setdefault(joint_name, 0)
+
+        # load image
+        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
-            print(f"⚠ Could not read image: {path}")
             continue
 
         H, W = img.shape
         img_resized = cv2.resize(img, (1024, 1024))
 
-        # Convert to tensor
         rgb = cv2.cvtColor(img_resized, cv2.COLOR_GRAY2RGB)
         tensor = to_tensor(rgb).unsqueeze(0).to(DEVICE)
 
-        # GT mask
+        # load GT mask
         anns = ann_map.get(img_id, [])
         if len(anns) == 0:
             continue
 
         gt_mask = polygon_to_mask(anns[0]["segmentation"], H, W)
-        gt_mask_resized = cv2.resize(gt_mask, (1024, 1024), interpolation=cv2.INTER_NEAREST)
+        gt_resized = cv2.resize(gt_mask, (1024, 1024), interpolation=cv2.INTER_NEAREST)
 
-        # Inference
+        # inference
         with torch.no_grad():
             out = model(tensor)
 
         pred = out["mask_logits"].sigmoid()[0, 0].cpu().numpy()
         pred = cv2.resize(pred, (1024, 1024), interpolation=cv2.INTER_NEAREST)
 
-        # Metrics
-        d = dice(pred, gt_mask_resized)
-        j = iou(pred, gt_mask_resized)
+        # compute metrics
+        d = dice(pred, gt_resized)
+        j = iou(pred, gt_resized)
 
-        dice_scores.append(d)
-        iou_scores.append(j)
+        class_dice[joint_name].append(d)
+        class_iou[joint_name].append(j)
+        class_count[joint_name] += 1
 
-        # -------------------------
-        # Visualization save
-        # -------------------------
-        overlay = np.zeros((1024, 1024, 3), dtype=np.uint8)
-        overlay[..., 1] = (pred * 255).astype(np.uint8)
-        overlay[..., 0] = (gt_mask_resized * 255).astype(np.uint8)
-
-        out_path = os.path.join(OUT_DIR, f"{img_id:04d}_overlay.png")
-
-        fig, ax = plt.subplots(1, 3, figsize=(16, 6))
-        ax[0].imshow(rgb, cmap="gray")
-        ax[0].set_title("Image")
-
-        ax[1].imshow(pred, cmap="gray")
-        ax[1].set_title("Predicted Mask")
-
-        ax[2].imshow(overlay)
-        ax[2].set_title("GT (Red) / Pred (Green)")
-
-        for a in ax:
-            a.axis("off")
-
-        plt.savefig(out_path, dpi=150)
-        plt.close()
-
-        print(f"Processed {fname}  Dice={d:.4f}, IoU={j:.4f}")
-
-    # -------------------------
-    # Final report
-    # -------------------------
+    # --------------------------------------
+    # Final summary
+    # --------------------------------------
     print("\n======================")
-    print(" EVALUATION RESULTS")
+    print(" PER-JOINT METRICS")
     print("======================")
-    print(f"Mean Dice: {np.mean(dice_scores):.4f}")
-    print(f"Mean IoU : {np.mean(iou_scores):.4f}")
+    joint_names = sorted(class_dice.keys())
+
+    total_dice = []
+    total_iou  = []
+
+    for jn in joint_names:
+        if class_count[jn] == 0:
+            continue
+        mean_d = np.mean(class_dice[jn])
+        mean_i = np.mean(class_iou[jn])
+
+        total_dice.append(mean_d)
+        total_iou.append(mean_i)
+
+        print(f"{jn:6s} | Dice={mean_d:.4f} | IoU={mean_i:.4f} | N={class_count[jn]}")
+
+    print("\n======================")
+    print(" OVERALL RESULTS")
+    print("======================")
+    print(f"Mean Dice: {np.mean(total_dice):.4f}")
+    print(f"Mean IoU : {np.mean(total_iou):.4f}")
     print("======================\n")
 
 
-# --------------------------------------------------------
-# Main
-# --------------------------------------------------------
+# --------------------------------------
 if __name__ == "__main__":
     model = load_trained_model()
     evaluate(model)

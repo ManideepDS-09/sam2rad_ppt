@@ -24,37 +24,26 @@ import random
 import torch
 import torchvision.transforms.functional as TF
 
-def apply_augmentations(img, masks):
-    # Horizontal flip
+def apply_augmentations(img, masks): # followed this page for augmentation -- https://medium.com/@benjybo7/7-game-changing-data-augmentations-you-need-to-try-a3ec68a2cb62
+    # ---------- 1. Horizontal flip ----------
     if random.random() < 0.5:
         img = TF.hflip(img)
         masks = masks.flip(dims=[2])
 
-    # Brightness jitter
+    # ---------- 2. Vertical flip (rare but helps robustness) ----------
+    if random.random() < 0.1:
+        img = TF.vflip(img)
+        masks = masks.flip(dims=[1])
+
+    # ---------- 3. Rotation ----------
     if random.random() < 0.5:
-        brightness_factor = 1.0 + 0.1 * (random.random() - 0.5)
-        img = TF.adjust_brightness(img, brightness_factor)
+        angle = random.uniform(-12, 12)
+        img = TF.rotate(img, angle, fill=0)
+        masks = TF.rotate(masks, angle, fill=0)
 
-    # Contrast jitter
-    if random.random() < 0.5:
-        contrast_factor = 1.0 + 0.1 * (random.random() - 0.5)
-        img = TF.adjust_contrast(img, contrast_factor)
-
-    # Add Gaussian noise
-    if random.random() < 0.3:
-        noise = torch.randn_like(img) * 0.03
-        img = img + noise
-        img = torch.clamp(img, 0.0, 1.0)
-
-    # Random rotation
-    if random.random() < 0.5:
-        angle = random.uniform(-10, 10)
-        img = TF.rotate(img, angle)
-        masks = TF.rotate(masks, angle)
-
-    # Random scaling and zoom
-    if random.random() < 0.3:
-        scale = random.uniform(0.9, 1.1)
+    # ---------- 4. Random scaling ----------
+    if random.random() < 0.4:
+        scale = random.uniform(0.85, 1.15)
         h, w = img.shape[-2:]
         new_h, new_w = int(h * scale), int(w * scale)
         img = TF.resize(img, [new_h, new_w])
@@ -62,17 +51,43 @@ def apply_augmentations(img, masks):
         img = TF.center_crop(img, [h, w])
         masks = TF.center_crop(masks, [h, w])
 
-    # Gamma correction
+    # ---------- 5. Gaussian blur ----------
     if random.random() < 0.3:
-        gamma = random.uniform(0.7, 1.5)
-        img = TF.adjust_gamma(img, gamma)
+        k = random.choice([3, 5])
+        sigma = random.uniform(0.5, 1.2)
+        img = TF.gaussian_blur(img, kernel_size=k, sigma=sigma)
+
+    # ---------- 6. Speckle Noise (Ultrasound style) ----------
+    if random.random() < 0.4:
+        noise = torch.randn_like(img) * 0.15
+        img = img + img * noise
+        img = torch.clamp(img, 0.0, 1.0)
+
+    # ---------- 7. Intensity Jitter ----------
+    if random.random() < 0.5:
+        img = TF.adjust_brightness(img, random.uniform(0.7, 1.3))
+    if random.random() < 0.5:
+        img = TF.adjust_contrast(img, random.uniform(0.7, 1.3))
+    if random.random() < 0.3:
+        img = TF.adjust_gamma(img, random.uniform(0.7, 1.4))
+
+    # Random Cutout (SpecAugment-style)
+    if random.random() < 0.4:
+        C, H, W = img.shape
+        drop_w = int(W * random.uniform(0.05, 0.15))
+        drop_h = int(H * random.uniform(0.05, 0.15))
+        x0 = random.randint(0, max(1, W - drop_w))
+        y0 = random.randint(0, max(1, H - drop_h))
+        img[:, y0:y0+drop_h, x0:x0+drop_w] *= random.uniform(0.0, 0.3)
+        masks[:, y0:y0+drop_h, x0:x0+drop_w] = 0
+
 
     return img, masks
 
 # ==========================================
 #   NEW — Compute PPN Targets from mask
 # ==========================================
-def compute_ppn_targets(mask):
+#def compute_ppn_targets(mask):
     """
     mask: Tensor [H,W] binary (0/1)
     Returns:
@@ -144,8 +159,6 @@ def compute_ppn_targets(mask):
     labels = np.array([[1], [1], [1], [1], [1], [0], [0]], dtype=np.float32)
     return pts_norm, labels
 
-
-
 # ============================
 #        COCO Dataset
 # ============================
@@ -187,6 +200,8 @@ class CocoUSHandDataset(Dataset):
         anns = self.ann_map.get(img_id, [])
 
         mask_list = []
+        class_id_list = []              # >>> NEW: CLASS ID <<<
+
         for ann in anns:
             if "segmentation" in ann:
                 mask = self._seg_to_mask(
@@ -197,6 +212,14 @@ class CocoUSHandDataset(Dataset):
                     orig_w=img_info["width"]
                 )
                 mask_list.append(mask)
+
+                #  ------------ NEW HERE ------------
+                # Coco format always provides "category_id".
+                cid = ann.get("category_id", None)
+                if cid is None:
+                    cid = -1              # safety fallback
+                class_id_list.append(cid)  # store class id
+
         
         # -------------------------------------------------------
         # NEW: Compute 7 PPN GT points for each bone mask
@@ -220,6 +243,7 @@ class CocoUSHandDataset(Dataset):
            dummy_lbl = np.zeros((7, 1), dtype=np.float32)
            ppn_pts_list = [dummy_pts]
            ppn_lbl_list = [dummy_lbl]
+           class_id_list = [-1] # >>> NEW: ensure dummy class id <<<
         else:
             #asks = mask_list[0].unsqueeze(0).float()
            #merged = torch.sum(torch.stack(mask_list, dim=0), dim=0)
@@ -241,7 +265,8 @@ class CocoUSHandDataset(Dataset):
 
         return {
             "image": img,                     
-            "masks": masks,                   
+            "masks": masks,
+            "class_ids": torch.tensor(class_id_list, dtype=torch.long),  # >>> NEW <<<                   
 #           "ppn_points": torch.tensor(pts, dtype=torch.float32),   # (7,2)
 #           "ppn_labels": torch.tensor(lbl, dtype=torch.float32),   # (7,1)
             "ppn_points": ppn_pts_list,
@@ -278,58 +303,88 @@ class CocoUSHandDataset(Dataset):
         return torch.from_numpy(mask)
     
     def _compute_ppn_points(self, mask):
-        # mask: (H,W) numpy array with 0/1 values
+        """
+        New Phase-2 PPN GT:
+        - 3 FG points: center, major_min, major_max
+        - 4 BG points: top, bottom, left, right background samples
+        """
+
         H, W = mask.shape
         ys, xs = np.where(mask > 0)
 
-        if len(xs) == 0:
-            # return zeros to keep shape consistent
+        # Mask empty → return zeros
+        if len(xs) < 10:
             pts = np.zeros((7, 2), dtype=np.float32)
             lbl = np.zeros((7, 1), dtype=np.float32)
             return pts, lbl
 
         coords = np.column_stack([xs, ys]).astype(np.float32)
 
-        # centroid
+        # ---------- 1. Centroid ----------
         cx = coords[:, 0].mean()
         cy = coords[:, 1].mean()
 
-        # extrema
-        left_idx  = np.argmin(coords[:, 0])
-        right_idx = np.argmax(coords[:, 0])
-
-        # PCA
+        # ---------- 2. PCA for the major axis only ----------
         centered = coords - np.array([[cx, cy]])
-        cov = np.cov(centered.T)
-        eigvals, eigvecs = np.linalg.eig(cov)
-        order = np.argsort(-eigvals)
-        v1 = eigvecs[:, order[0]]
-        v2 = eigvecs[:, order[1]]
+        U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+        pc1 = Vt[0]  # major axis
 
-        proj1 = centered @ v1
-        proj2 = centered @ v2
+        proj1 = centered @ pc1
+        major_min = coords[np.argmin(proj1)]
+        major_max = coords[np.argmax(proj1)]
 
-        p1 = coords[np.argmin(proj1)]
-        p2 = coords[np.argmax(proj1)]
-        p3 = coords[np.argmin(proj2)]
-        p4 = coords[np.argmax(proj2)]
+        # ---------- 3. Construct 4 structured background points ----------
+        bg_pts = []
 
+        # pick ANY zero mask pixel
+        bg_mask = (mask == 0)
+        by, bx = np.where(bg_mask)
+
+        if len(bx) == 0:
+            # fallback
+            bg_pts = [
+                [0, 0],               # top-left
+                [W - 1, 0],           # top-right
+                [0, H - 1],           # bottom-left
+                [W - 1, H - 1]        # bottom-right
+            ]
+        else:
+            # Four deterministic BG points (no randomness)
+            bg_pts = []
+            k = np.argsort(bx + by)  # simple stable ordering
+            sel = [
+                len(k) // 8,
+                len(k) // 4,
+                len(k) // 2,
+                3 * len(k) // 4
+            ]
+            for idx in sel:
+                i = k[idx]
+                bg_pts.append([bx[i], by[i]])
+
+        # ---------- 4. Pack FG (3) + BG (4) ----------
         pts = np.array([
-            [cx, cy],                  # 0 center
-            coords[left_idx],          # 1 leftmost
-            coords[right_idx],         # 2 rightmost
-            p1, p2,                    # 3,4 major axis
-            p3, p4                     # 5,6 minor axis
+            [cx, cy],         # 0 FG center
+            major_min,        # 1 FG major-
+            major_max,        # 2 FG major+
+            bg_pts[0],        # BG1
+            bg_pts[1],        # BG2
+            bg_pts[2],        # BG3
+            bg_pts[3],        # BG4
         ], dtype=np.float32)
 
-        # normalize 0-1
-        pts[:, 0] /= W
-        pts[:, 1] /= H
+        # ---------- 5. Normalize to [0,1] ----------
+        pts_norm = pts.copy()
+        pts_norm[:, 0] /= W
+        pts_norm[:, 1] /= H
 
-        # create labels: all foreground = 1
-        lbl = np.ones((7, 1), dtype=np.float32)
+        # ---------- 6. Labels (3 FG + 4 BG) ----------
+        labels = np.array([
+            [1], [1], [1],  # 3 FG
+            [0], [0], [0], [0]  # 4 BG
+        ], dtype=np.float32)
 
-        return pts, lbl
+        return pts_norm, labels
 
 
 def collate_with_ppn(batch):
@@ -343,12 +398,15 @@ def collate_with_ppn(batch):
     ppn_labels = []
     image_ids = []
     file_names = []
+    class_ids = []  # >>> NEW <<<
 
     for item in batch:
         images.append(item["image"])
         masks.append(item["masks"])
         image_ids.append(item["image_id"])
         file_names.append(item["file_name"])
+        class_ids.append(item["class_ids"])      # <<< FIXED LOCATION
+
 
         # item["ppn_points"] = list of (7,2)
         # flatten:
@@ -398,9 +456,24 @@ def collate_with_ppn(batch):
     ppn_points = torch.stack(padded_pts, dim=0)    # (B, max_pts, 2)
     ppn_labels = torch.stack(padded_lbl, dim=0)    # (B, max_pts, 1)
 
+    # >>> NEW: pad class ids so shapes match across batch
+    max_inst = masks.shape[1]  # already computed above
+
+    padded_cls = []
+    for c in class_ids:
+        inst = c.shape[0]
+        if inst < max_inst:
+            pad = torch.full((max_inst - inst,), -1, dtype=torch.long)
+            c = torch.cat([c, pad], dim=0)
+        padded_cls.append(c)
+
+    class_ids = torch.stack(padded_cls, dim=0)  # (B, max_inst)
+
+
     return {
         "image": images,
         "masks": masks,
+        "class_ids": class_ids,
         "ppn_points": ppn_points,
         "ppn_labels": ppn_labels,
         "image_id": image_ids,

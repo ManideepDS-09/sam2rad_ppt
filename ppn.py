@@ -59,35 +59,43 @@ class PPN(nn.Module):
     
     def forward(self, img_feats, num_bones=1):
         """
-        img_feats: SAM encoder output
-            shape (B, 256, H', W')
+        img_feats: (B,256,H`,W`)
+        num_bones: #instances for this image
         """
 
+        # CNN encoder for PPN
         x = F.relu(self.bn1(self.conv1(img_feats)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))
 
-        # Global average pooling
-        x = self.pool(x)         # (B,256,1,1)
-        x = x.squeeze(-1).squeeze(-1)  # (B,256)
-        total_points = self.num_points * num_bones
+        # Global descriptor (B,256)
+        x = self.pool(x).squeeze(-1).squeeze(-1)
 
-        # Predict per-bone, unique 7 points
-        point_xy = self.mlp_points(x)                     # (B, 14)
-        point_xy = point_xy.unsqueeze(1).repeat(1, num_bones, 1)  
-        point_xy = point_xy.reshape(-1, num_bones, 7, 2)  # (B, num_bones, 7, 2)
-        point_xy = point_xy.reshape(-1, total_points, 2)  # (B, 7*num_bones, 2)
-        point_xy = torch.sigmoid(point_xy)
+        # -------------------------------------------------------
+        # Predict UNIQUE 7 points for EACH bone
+        # instead of duplicating the same 7 points N times.
+        # -------------------------------------------------------
+        B = x.shape[0]
+        P = self.num_points     # 7
 
-        # Predict labels (foreground=1, background=0)
-        point_logits = self.mlp_labels(x)        # (B, num_points)
-        point_logits = point_logits.unsqueeze(1).repeat(1, num_bones, 1)
-        point_logits = point_logits.view(-1, total_points, 1)
+        # Expand encoder feature → per-bone embedding
+        # (B, 256) → (B, num_bones, 256)
+        x_rep = x.unsqueeze(1).repeat(1, num_bones, 1)
 
-        # Concatenate coords + label logit
-        """
-        output[:, i] = [x_i, y_i, logit_label_i]
-        """
-        output = torch.cat([point_xy, point_logits], dim=-1)  # (B, 7*num_bones, 3)
+        # Flatten to feed MLP
+        # (B * num_bones, 256)
+        x_flat = x_rep.reshape(B * num_bones, 256)
 
-        return output
+        # Predict 7*2 coords per bone
+        coords = self.mlp_points(x_flat)                 # (B*num_bones, 14)
+        coords = coords.reshape(B, num_bones, P, 2)      # (B, num_bones, 7, 2)
+        coords = torch.sigmoid(coords)
+        coords = coords.reshape(B, num_bones * P, 2)     # (B,7*num_bones,2)
+
+        # Predict 7 labels per bone
+        labels = self.mlp_labels(x_flat)                 # (B*num_bones, 7)
+        labels = labels.reshape(B, num_bones * P, 1)     # (B,7*num_bones,1)
+
+        # Final: (B, 7*num_bones, 3)
+        out = torch.cat([coords, labels], dim=-1)
+        return out
