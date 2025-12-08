@@ -271,8 +271,8 @@ def run_inference(model, dicom_path, frame_idx, save_images=True):
 # MAIN
 # -------------------------------------------------
 if __name__ == "__main__":
-    DICOM_PATH = "/home/ds/Desktop/Hand_dicom/K02.dcm"
-    FRAME     = 765
+    DICOM_PATH = "/home/ds/Desktop/Hand_dicom/H021.dcm"
+    FRAME     = 1129
 
     model = load_model()
     run_inference(model, DICOM_PATH, FRAME, save_images=True)

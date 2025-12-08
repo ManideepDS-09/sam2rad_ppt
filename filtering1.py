@@ -219,7 +219,7 @@ def interval_overlap(a_start, a_end, b_start, b_end):
     lo = max(a_start, b_start); hi = min(a_end, b_end)
     return max(0, hi - lo + 1)
 
-def adaptive_radius_from_len(iv_len, rmin=8, rmax=40):
+def adaptive_radius_from_len(iv_len, rmin=4, rmax=10):
     return int(max(rmin, min(rmax, iv_len // 4)))
 
 def make_window(center, radius, n_frames):
@@ -240,7 +240,7 @@ def stitch_intervals(runs, max_gap=STITCH_MAX_GAP):
     merged.append((cur_s, cur_e))
     return merged
 
-def compute_bone_centered_windows(bone_runs, n_frames, radius=None, rmin=8, rmax=40):
+def compute_bone_centered_windows(bone_runs, n_frames, radius=None, rmin=4, rmax=10):
     wins = []
     for s_bone, e_bone in bone_runs:
         c_bone = (s_bone + e_bone) // 2
@@ -564,10 +564,10 @@ def scan_dicom_for_horizontal_bars(
     # bone = frames NOT in any bar and NOT blank
     bar_set   = set(all_bar_frames)
     no_bar = [k for k in range(1, n_frames + 1) if k not in bar_set and k not in blank_set]
-    bone_runs = consecutive_intervals(no_bar, merge_gap=7)
+    bone_runs = consecutive_intervals(no_bar, merge_gap=4)
 
     # windows
-    bone_windows = compute_bone_centered_windows(bone_runs, n_frames=n_frames, radius=None, rmin=8, rmax=40)
+    bone_windows = compute_bone_centered_windows(bone_runs, n_frames=n_frames, radius=None, rmin=4, rmax=10)
     bar_radius = 5
     bar_windows = compute_bar_gap_windows(bar_runs, n_frames=n_frames, radius=bar_radius)
 
@@ -612,10 +612,10 @@ def scan_dicom_for_horizontal_bars(
 if __name__ == "__main__":
     # Example run (keep your original params)
     result = scan_dicom_for_horizontal_bars(
-        "/home/ds/Desktop/Hand_dicom/H036.dcm",
+        "/home/ds/Desktop/Hand_dicom/K11.dcm",
         canny_low=60, canny_high=180,
         hough_std_threshold=150,
         houghp_threshold=200,
-        min_line_len_ratio=0.75,
-        angle_tol_deg=2,
+        min_line_len_ratio=0.90,
+        angle_tol_deg=4,
     )

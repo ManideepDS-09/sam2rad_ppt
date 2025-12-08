@@ -68,21 +68,26 @@ class OutConv(nn.Module):
         return self.conv(x)
 
 
-class UNet32(nn.Module):
-    def __init__(self, n_channels=3, n_classes=19):
+class UNet(nn.Module):
+    """
+    Vanilla UNet. Works on rectangular 640x480 too, because we pad in Up.
+    """
+    def __init__(self, in_channels=1, out_channels=1, base_c=64, bilinear=True):
         super().__init__()
-        self.inc = DoubleConv(n_channels, 32)
-        self.down1 = Down(32, 64)
-        self.down2 = Down(64, 128)
-        self.down3 = Down(128, 256)
-        self.down4 = Down(256, 256)
+        self.inc = DoubleConv(in_channels, base_c)
+        self.down1 = Down(base_c, base_c*2)
+        self.down2 = Down(base_c*2, base_c*4)
+        self.down3 = Down(base_c*4, base_c*8)
+        # bottleneck
+        factor = 2 if bilinear else 1
+        self.down4 = Down(base_c*8, base_c*16 // factor)
 
-        self.up1 = Up(256+256, 128)
-        self.up2 = Up(128+128, 64)
-        self.up3 = Up(64+64, 32)
-        self.up4 = Up(32+32, 32)
+        self.up1 = Up(base_c*16, base_c*8 // factor, bilinear)
+        self.up2 = Up(base_c*8, base_c*4 // factor, bilinear)
+        self.up3 = Up(base_c*4, base_c*2 // factor, bilinear)
+        self.up4 = Up(base_c*2, base_c, bilinear)
 
-        self.outc = OutConv(32, n_classes)
+        self.outc = OutConv(base_c, out_channels)
 
     def forward(self, x):
         x1 = self.inc(x)
@@ -92,8 +97,8 @@ class UNet32(nn.Module):
         x5 = self.down4(x4)
 
         x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
-
-        return self.outc(x)
+        x = self.up2(x,  x3)
+        x = self.up3(x,  x2)
+        x = self.up4(x,  x1)
+        logits = self.outc(x)
+        return logits

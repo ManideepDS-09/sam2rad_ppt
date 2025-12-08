@@ -5,8 +5,8 @@
 # ===========================================
 
 model:
-  sam_type: "vit_h"
-  sam_checkpoint: "/home/ds/Desktop/sam_hand/sam_hand/sam_vit_h_4b8939.pth"
+  sam_type: "vit_b"
+  sam_checkpoint: "/home/ds/Desktop/sam_hand/sam_hand/sam_vit_b_01ec64.pth"
 
   # Freeze encoder except LoRA patches
   freeze_encoder: true
@@ -67,5 +67,5 @@ losses:
   iou_loss: true
 
 save:
-  output_dir: "checkpoints_sam2rad_train_4/"
+  output_dir: "checkpoints_sam2rad_train_sam_b/"
   save_every: 5
