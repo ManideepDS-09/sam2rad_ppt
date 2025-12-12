@@ -134,7 +134,6 @@ def compute_OR_from_components(comps, rgb, out_path):
 
     # ----------------------------------------------------------------------
     # DO NOT TOUCH THE LOGIC BELOW
-    # EXACT same block you wrote earlier
     # ----------------------------------------------------------------------
 
     # ======================= 3 bones => OR1 =======================

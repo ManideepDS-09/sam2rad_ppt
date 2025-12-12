@@ -7,13 +7,13 @@ import cv2 as cv
 import pydicom
 
 # ---------------- Config toggles (tune freely) ----------------
-ENHANCE_FOR_DETECTION      = True   # use enhanced frames during Hough detection
+ENHANCE_FOR_DETECTION      = False   # use enhanced frames during Hough detection
 REFINE_WINDOWS_WITH_SOBEL  = False   # trim/split fused windows with Sobel+brightness rule
 
 # Enhancement params
 CLAHE_CLIP       = 2.0
-CLAHE_TILE_GRIDS = (8, 8)
-GAUSS_SIGMA_PX   = 1   # ~1-1.5 px is good after CLAHE
+CLAHE_TILE_GRIDS = (4, 4)
+GAUSS_SIGMA_PX   = 1.5   # ~1-1.5 px is good after CLAHE
 MEDIAN_KSIZE     = 3
 
 # Sobel refinement params
@@ -193,12 +193,12 @@ def detect_horizontal_bar_in_frame(img_u8,
 
     # Probabilistic Hough
     has_prob_bar = False
+    valid_lines = 0
     lines_prob = cv.HoughLinesP(edges, houghp_rho, houghp_theta, houghp_threshold,
                                 minLineLength=min_line_horizontal,
                                 maxLineGap=max_line_gap)
     n_prob = 0 if lines_prob is None else len(lines_prob)
     if lines_prob is not None:
-        valid_lines = 0
         for (x1, y1, x2, y2) in lines_prob[:, 0, :]:
             ang = angle_deg_from_segment(x1, y1, x2, y2)
             if not is_angle_bar(ang, tol_deg=angle_tol_deg):
@@ -208,7 +208,8 @@ def detect_horizontal_bar_in_frame(img_u8,
             length = math.hypot(x2 - x1, y2 - y1)
             if length >= min_line_horizontal:
                 valid_lines += 1
-            has_prob_bar = valid_lines >= 2
+    has_prob_bar = valid_lines >= 2
+    n_prob = valid_lines
 
     return has_std_bar, n_std, has_prob_bar, n_prob, lines_prob
 
@@ -219,7 +220,7 @@ def interval_overlap(a_start, a_end, b_start, b_end):
     lo = max(a_start, b_start); hi = min(a_end, b_end)
     return max(0, hi - lo + 1)
 
-def adaptive_radius_from_len(iv_len, rmin=8, rmax=40):
+def adaptive_radius_from_len(iv_len, rmin=2, rmax=5):
     return int(max(rmin, min(rmax, iv_len // 4)))
 
 def make_window(center, radius, n_frames):
@@ -240,7 +241,7 @@ def stitch_intervals(runs, max_gap=STITCH_MAX_GAP):
     merged.append((cur_s, cur_e))
     return merged
 
-def compute_bone_centered_windows(bone_runs, n_frames, radius=None, rmin=2, rmax=20):
+def compute_bone_centered_windows(bone_runs, n_frames, radius=None, rmin=2, rmax=5):
     wins = []
     for s_bone, e_bone in bone_runs:
         c_bone = (s_bone + e_bone) // 2
@@ -499,12 +500,10 @@ def scan_dicom_for_horizontal_bars(
         min_line_len_ratio=0.75,
         max_line_gap=5,
         angle_tol_deg=2,
-        verbose_every=200):
+        verbose_every=200,
+        debug_start=None,
+        debug_end=None):
 
-        # Manual frames you want debug on:
-    MANUAL_FRAMES = [974,875,753,662,1062,242,184,111,334,564,497,401,334,974,875,753,662]
-    MANUAL_FRAMES = sorted(set(MANUAL_FRAMES))  # uniq+sorted
-    print("\n[DBG] Tracking manual candidate frames:", MANUAL_FRAMES)
     ds = pydicom.dcmread(dicom_path)
     arr = ds.pixel_array
     if arr.ndim == 2:
@@ -514,12 +513,22 @@ def scan_dicom_for_horizontal_bars(
 
     n_frames = arr.shape[0]
     subject = os.path.splitext(os.path.basename(dicom_path))[0]
-    print(f"Scanning {subject}: {n_frames} frames")
+    max_frames = min(500, n_frames)
+    arr = arr[:max_frames]   # hard clip the data itself
+    n_frames = max_frames   # now the entire pipeline is truly capped
+    print(f"Scanning {subject}")
+    if debug_start is None:
+        debug_start = 1
+    if debug_end is None or debug_end > n_frames:
+        debug_end = n_frames
+    debug_start = max(1, debug_start)
 
     std_bar, prob_bar = [], []
     std_counts, prob_counts = [], []
+    has_std_flags = []
+    has_prob_flags = []
 
-    for i in range(n_frames):
+    for i in range(max_frames):
         img = to_uint8(arr[i])
         if ENHANCE_FOR_DETECTION:
             img = enhance_frame_only(img)
@@ -540,13 +549,9 @@ def scan_dicom_for_horizontal_bars(
             prob_bar.append(i + 1)
         std_counts.append(n_std)
         prob_counts.append(n_prob)
-                # ---- DEBUG bar detection for manual frames ----
-        fidx = i + 1
-        if fidx in MANUAL_FRAMES:
-            print(f"[DBG][bar-detect] frame={fidx}  "
-                  f"STDbar={has_std}({n_std})  "
-                  f"PROBbar={has_prob}({n_prob})")
-
+        #NEW: remember per-frame bar evidence
+        has_std_flags.append(has_std)
+        has_prob_flags.append(has_prob)
 
     # intervals
     std_runs = consecutive_intervals(std_bar)
@@ -561,11 +566,6 @@ def scan_dicom_for_horizontal_bars(
             if is_blank_or_flat(arr[i]):
                 blank_frames.append(i + 1)
         blank_set = set(blank_frames)
-        print("\n[DBG] Blank frames detected:", len(blank_frames))
-        for f in MANUAL_FRAMES:
-            if f in blank_frames:
-                print(f"[DBG][blank] manual frame {f} was flagged as BLANK")
-
 
     else:
         blank_set = set()
@@ -580,22 +580,39 @@ def scan_dicom_for_horizontal_bars(
     # bone = frames NOT in any bar and NOT blank
     bar_set   = set(all_bar_frames)
     no_bar = [k for k in range(1, n_frames + 1) if k not in bar_set and k not in blank_set]
-    bone_runs = consecutive_intervals(no_bar, merge_gap=10)
-    print("\n[DBG] bone_runs:", bone_runs)
-    for f in MANUAL_FRAMES:
-        inside = any(s <= f <= e for (s,e) in bone_runs)
-        if not inside:
-            print(f"[DBG][bone-run] manual frame {f} NOT in bone_runs")
+    bone_runs = consecutive_intervals(no_bar, merge_gap=4)
+    # ------------- per-frame debug print -------------
+    print(f"\n[DEBUG] Per-frame classification for frames {debug_start}..{debug_end}")
+    for k in range(debug_start, debug_end + 1):
+        idx = k - 1
+        is_bar   = (k in bar_set)
+        is_blank = (k in blank_set)
+
+        if is_blank:
+            status = "BLANK"
+            reason = "flat / low-structure frame (blank detection)"
+        elif is_bar:
+            status = "BAR"
+            reasons = []
+            if has_std_flags[idx]:
+                reasons.append("Std Hough found near-horizontal line")
+            if has_prob_flags[idx]:
+                reasons.append("Prob Hough found long near-horizontal segment")
+            if not reasons:
+                reasons.append("flagged as bar frame by Hough logic")
+            reason = "; ".join(reasons)
+        else:
+            status = "BONE"
+            reason = "no horizontal bars and not blank (candidate bone interval)"
+
+        print(
+            f"frame {k:4d}: {status:5s} | "
+            f"std_lines={std_counts[idx]:2d}  prob_lines={prob_counts[idx]:2d} | {reason}"
+        )
 
 
     # windows
-    bone_windows = compute_bone_centered_windows(bone_runs, n_frames=n_frames, radius=None, rmin=2, rmax=20)
-    print("\n[DBG] bone_runs:", bone_runs)
-    for f in MANUAL_FRAMES:
-        inside = any(s <= f <= e for (s,e) in bone_runs)
-        if not inside:
-            print(f"[DBG][bone-run] manual frame {f} NOT in bone_runs")
-
+    bone_windows = compute_bone_centered_windows(bone_runs, n_frames=n_frames, radius=None, rmin=2, rmax=5)
     bar_radius = 5
     bar_windows = compute_bar_gap_windows(bar_runs, n_frames=n_frames, radius=bar_radius)
 
@@ -614,21 +631,7 @@ def scan_dicom_for_horizontal_bars(
         fused_rows, fused_spans = fused_rows_raw, fused_spans_raw
 
     # --------- Fused table AFTER Sobel refinement ----------
-    print("\n[DBG] Testing fused coverage on manual frames:")
-    fused = fused_rows  # refined or raw depending
-    for f in MANUAL_FRAMES:
-        hit = []
-        for r in fused_rows:
-            if r["source"] == "bar-only":
-                continue
-            if r["start"] <= f <= r["end"]:
-                hit.append((r["start"], r["end"], r["source"], r["s_bone"], r["e_bone"]))
-        if not hit:
-            print(f"[DBG][FUSED-MISS] manual frame {f} not covered by ANY fused interval")
-        else:
-            for (ws,we,src,bs,be) in hit:
-                print(f"[DBG][FUSED-HIT] frame {f} in {ws}-{we} (src={src}, bone_rng={bs}-{be})")
-        print_fused_windows_table("[4R] Fused windows (post-refine: after Sobel)", fused_rows, use_color=True)
+    print_fused_windows_table("[4R] Fused windows (post-refine: after Sobel)", fused_rows, use_color=True)
 
     # stitch for display (optional for diagnostics)
     fused_spans.sort(key=lambda x: x[0])
@@ -654,10 +657,12 @@ def scan_dicom_for_horizontal_bars(
 if __name__ == "__main__":
     # Example run (keep your original params)
     result = scan_dicom_for_horizontal_bars(
-        "/home/ds/Desktop/Hand_dicom/H036.dcm",
+        "/home/ds/Desktop/Hand_dicom/K11.dcm",
         canny_low=60, canny_high=180,
         hough_std_threshold=150,
         houghp_threshold=200,
-        min_line_len_ratio=0.75,
-        angle_tol_deg=2,
+        min_line_len_ratio=0.99,
+        angle_tol_deg=15,
+        debug_start=1,
+        debug_end=300,
     )

@@ -108,15 +108,8 @@ class BoneClassLoss(nn.Module):
         self.loss = nn.CrossEntropyLoss(ignore_index=-1)
 
     def forward(self, pred_logits, gt_class_ids):
-        """
-        pred_logits: (..., num_classes)
-        gt_class_ids: same leading shape as pred_logits except last dim
-                      (e.g. (B, N), (B, N, K), etc.)
-        """
-        # last dim is num_classes
         num_classes = pred_logits.shape[-1]
 
-        # DEBUG (keep for now, you can comment later)
         print("BoneClassLoss pred_logits.shape:", pred_logits.shape)
         print("BoneClassLoss gt_class_ids.shape:", gt_class_ids.shape)
         print("\n--- BoneClassLoss DEBUG ---")
@@ -126,10 +119,22 @@ class BoneClassLoss(nn.Module):
         print("gt unique:", torch.unique(gt_class_ids))
         print("---------------------------\n")
 
+        # HARD NaN GUARD
+        if torch.isnan(pred_logits).any() or torch.isnan(gt_class_ids).any():
+            return torch.zeros((), device=pred_logits.device)
 
-        # flatten everything except class dimension
-        logits_flat = pred_logits.reshape(-1, num_classes)   # (M, num_classes)
-        labels_flat = gt_class_ids.reshape(-1)               # (M,)
+        # KEEP YOUR FLATTEN LOGIC
+        logits_flat = pred_logits.reshape(-1, num_classes)
+        labels_flat = gt_class_ids.reshape(-1)
+
+        #  CORRECT VALID MASK (NO -1 PASSED IN)
+        valid = (labels_flat >= 0) & (labels_flat < num_classes)
+        logits_flat = logits_flat[valid]
+        labels_flat = labels_flat[valid]
+
+        # EMPTY GUARD
+        if labels_flat.numel() == 0:
+            return torch.zeros((), device=pred_logits.device)
 
         return self.loss(logits_flat, labels_flat)
 

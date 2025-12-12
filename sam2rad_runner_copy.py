@@ -16,8 +16,8 @@ CLASS_MAP = {
     16: "PD1", 17: "PP1", 18: "or",
 }
 
-SAM_CKPT = "/home/ds/Desktop/sam_hand/sam_hand/sam_vit_h_4b8939.pth"
-RAD_CKPT = "/home/ds/Desktop/sam2rad_ppt/checkpoints_sam2rad/checkpoints/epoch_0009.pth"
+SAM_CKPT = "/home/ds/Desktop/sam_hand/sam_hand/sam_vit_b_01ec64.pth"
+RAD_CKPT = "/home/ds/Desktop/sam2rad_ppt/checkpoints_sam2rad_train_sam_b_2/checkpoints/best_model.pth"
 
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _GLOBAL_MODEL = None

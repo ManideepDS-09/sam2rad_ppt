@@ -75,7 +75,7 @@ class SamBackbone(nn.Module):
         super().__init__()
 
         # Load original SAM-ViT-H
-        self.sam = sam_model_registry["vit_h"](checkpoint=sam_checkpoint)
+        self.sam = sam_model_registry["vit_b"](checkpoint=sam_checkpoint)
 
         # Add LoRA to qkv
         insert_lora_into_sam(self.sam, rank=lora_rank)

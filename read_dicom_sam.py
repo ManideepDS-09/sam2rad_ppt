@@ -44,8 +44,8 @@ CLASS_MAP = {
 # -------------------------------------------------
 # PATHS
 # -------------------------------------------------
-SAM_CKPT = "/home/ds/Desktop/sam_hand/sam_hand/sam_vit_h_4b8939.pth"
-RAD_CKPT = "/home/ds/Desktop/sam2rad_ppt/checkpoints_sam2rad/checkpoints/epoch_0009.pth"
+SAM_CKPT = "/home/ds/Desktop/sam_hand/sam_hand/sam_vit_b_01ec64.pth"
+RAD_CKPT = "/home/ds/Desktop/sam2rad_ppt/checkpoints_sam2rad_train_sam_b_2/checkpoints/best_model.pth"
 
 
 # -------------------------------------------------
@@ -160,7 +160,7 @@ def run_inference(model, dicom_path, frame_idx, save_images=True):
     # threshold (keep same threshold you chose earlier)
     #bin_mask = (pmask_big > 0.5).astype(np.uint8)
     #for thr in [0.25, 0.3, 0.35, 0.45, 0.55]:
-    for thr in [0.55,0.65,0.75,0.85]:
+    for thr in [0.65]:
         bin_mask = (pmask_big > thr).astype(np.uint8)
         num,_ = cv2.connectedComponents(bin_mask)
         print("threshold",thr,"→ components:",num-1)
@@ -266,13 +266,77 @@ def run_inference(model, dicom_path, frame_idx, save_images=True):
 
     return or_out
 
+#def run_inference(model, dicom_path, frame_idx, save_images=True):
+    print("\n=============== SAM2Rad RUN ===============")
+    print(f"Running OR on EXACT frame index: {frame_idx}")
+    print("===========================================\n")
+
+    # -------------------------------------------------
+    # LOAD ONLY ONE FRAME
+    # -------------------------------------------------
+    ds = pydicom.dcmread(dicom_path)
+    arr = ds.pixel_array
+    frame = arr[frame_idx].astype(np.uint8)   # <-- EXACTLY 1 FRAME
+
+    # normalize
+    f = frame.astype(np.float32)
+    f = (f - f.min()) / max(f.max() - f.min(), 1e-6)
+    f = (f * 255).astype(np.uint8)
+
+    # resize + to RGB
+    resized = cv2.resize(f, (1024, 1024))
+    rgb = cv2.cvtColor(resized, cv2.COLOR_GRAY2RGB)
+
+    tensor = to_tensor(rgb).unsqueeze(0).to(DEVICE)
+
+    # -------------------------------------------------
+    # INFERENCE
+    # -------------------------------------------------
+    with torch.no_grad():
+        # initial forward to guess number of bones
+        out = model(tensor, num_bones=5)
+        pts = out["ppn_coords"]
+        max_pts = pts.shape[1]
+        nb = max(1, max_pts // 7)
+
+        # final forward
+        out = model(tensor, num_bones=nb)
+
+    # -------------------------------------------------
+    # MASK + COMPONENTS
+    # -------------------------------------------------
+    pmask = out["mask_logits"].sigmoid()[0, 0].cpu().numpy()
+    pmask_big = cv2.resize(pmask, (1024,1024), interpolation=cv2.INTER_NEAREST)
+
+    bin_mask = (pmask_big > 0.5).astype(np.uint8)
+    num_labels, lab = cv2.connectedComponents(bin_mask)
+
+    comps = []
+    for cid in range(1, num_labels):
+        comp = (lab == cid).astype(np.uint8)
+        if comp.sum() >= MIN_COMP_AREA:
+            comps.append(comp)
+
+    # -------------------------------------------------
+    # OR calculation
+    # -------------------------------------------------
+    or_res = compute_OR_from_components(comps, rgb, None)
+
+    # attach bone count
+    or_res["bone_count"] = len(comps)
+
+    print("\n===== FINAL OR RESULT =====")
+    print(or_res)
+    print("===========================\n")
+
+    return or_res
 
 # -------------------------------------------------
 # MAIN
 # -------------------------------------------------
 if __name__ == "__main__":
-    DICOM_PATH = "/home/ds/Desktop/Hand_dicom/H021.dcm"
-    FRAME     = 1129
+    DICOM_PATH = "/home/ds/Desktop/Hand_dicom/H038.dcm"
+    FRAME     =  159
 
     model = load_model()
     run_inference(model, DICOM_PATH, FRAME, save_images=True)

@@ -86,5 +86,695 @@ Backprop
 
 
 
+#!/usr/bin/env python
+import os
+import numpy as np
+import pydicom
+import cv2 as cv
+
+from skimage.morphology import skeletonize
+
+# HARD-CODED DICOM PATH
+DICOM_PATH = "/home/ds/Desktop/Hand_dicom/H007.dcm"
+
+from filtering1 import (
+    enhance_frame_only,
+    to_uint8,
+    is_blank_or_flat,
+)
+
+# ----------------- Parameters -----------------
+BAR_SPAN_RATIO    = 0.50
+BAR_MAX_ANGLE_DEG = 15.0
+BAR_MIN_LINEARITY = 15.0
+
+MIN_CONSEC_BAR   = 3
+MIN_CONSEC_BONE  = 5
+MIN_CONSEC_BLANK = 10
+
+# --- Adaptive Temporal Voting ---
+BAR_ENTER_TH = 4     # how many consecutive BAR votes to enter BAR
+BONE_ENTER_TH = 2    # how many consecutive BONE votes to enter BONE
+
+BAR_EXIT_TH  = 2     # how many BONE votes needed to exit BAR
+BONE_EXIT_TH = 3     # how many BAR votes needed to exit BONE
+
+def adaptive_temporal_filter(raw_labels):
+    final_labels = []
+
+    current_state = raw_labels[0]
+    streak = 1
+
+    bar_streak = 0
+    bone_streak = 0
+
+    for i, lbl in enumerate(raw_labels):
+        if lbl == "BAR":
+            bar_streak += 1
+            bone_streak = 0
+        else:
+            bone_streak += 1
+            bar_streak = 0
+
+        # ---------------- ENTER CONDITIONS ----------------
+        if current_state == "BONE":
+            if bar_streak >= BAR_ENTER_TH:
+                current_state = "BAR"
+                bar_streak = 0
+                bone_streak = 0
+
+        elif current_state == "BAR":
+            if bone_streak >= BONE_ENTER_TH:
+                current_state = "BONE"
+                bar_streak = 0
+                bone_streak = 0
+
+        # ---------------- EXIT CONDITIONS (HYSTERESIS) ----------------
+        if current_state == "BAR":
+            if bone_streak >= BAR_EXIT_TH:
+                current_state = "BONE"
+                bar_streak = 0
+                bone_streak = 0
+
+        elif current_state == "BONE":
+            if bar_streak >= BONE_EXIT_TH:
+                current_state = "BAR"
+                bar_streak = 0
+                bone_streak = 0
+
+        final_labels.append(current_state)
+
+    return final_labels
+
+# ----------------- Classification --------------------
+def classify_frame_with_skeleton(frame):
+    f8 = to_uint8(frame)
+    f8 = enhance_frame_only(f8)
+
+    blank = is_blank_or_flat(f8)
+
+    h, w = f8.shape[:2]
+
+    # ---------------- ROI DEFINITION ----------------
+    top_end    = int(0.15 * h)
+    bottom_sta = int(0.50 * h)
+
+    roi_mask = np.zeros((h, w), dtype=bool)
+    roi_mask[:top_end, :] = True                 
+    roi_mask[bottom_sta:, :] = True              
+    # ------------------------------------------------
+
+    # Gradient strength (critical for blank detection)
+    gx = cv.Sobel(f8, cv.CV_32F, 1, 0, ksize=3)
+    gy = cv.Sobel(f8, cv.CV_32F, 0, 1, ksize=3)
+    grad_mean = float(np.mean(np.hypot(gx, gy)))
+
+    var_int = float(f8.var())
+
+    _, bw = cv.threshold(f8, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+    mask = bw > 0
+
+    # ---------------- APPLY ROI BEFORE SKELETON ----------------
+    mask = mask & roi_mask
+    # -----------------------------------------------------------
+
+    skel = skeletonize(mask)
+    coords = np.column_stack(np.nonzero(skel))
+    skel_pixels = int(coords.shape[0])
+
+    if coords.shape[0] < 10:
+        return "BONE", {
+            "span": 0.0,
+            "angle": 0.0,
+            "lin": 0.0,
+            "grad": grad_mean,
+            "var": var_int,
+            "skel_px": skel_pixels,
+            "blank": blank,
+        }
+
+    ys = coords[:, 0]
+    xs = coords[:, 1]
+
+    x_span = xs.max() - xs.min() + 1
+    span_ratio = x_span / float(w)
+
+    pts = np.column_stack([xs.astype(np.float32), ys.astype(np.float32)])
+    pts -= pts.mean(axis=0, keepdims=True)
+    cov = np.cov(pts, rowvar=False)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+
+    v = eigvecs[:, 0]
+    angle = abs(np.degrees(np.arctan2(v[1], v[0]))) % 180.0
+    angle = min(angle, 180.0 - angle)
+
+    lin = float(eigvals[0]) / float(eigvals[1] + 1e-6)
+
+    label = "BONE"
+
+    if not blank:
+        if (
+            span_ratio >= BAR_SPAN_RATIO
+            and angle <= BAR_MAX_ANGLE_DEG
+            and lin >= BAR_MIN_LINEARITY
+        ):
+            label = "BAR"
+    else:
+        label = "BLANK"
+
+    info = {
+        "span": span_ratio,
+        "angle": angle,
+        "lin": lin,
+        "grad": grad_mean,
+        "var": var_int,
+        "skel_px": skel_pixels,
+        "blank": blank,
+    }
+
+    return label, info
 
 
+# ----------------- State Machine --------------------
+
+def collect_intervals_with_state_machine(frame_stream, logs):
+    pockets = {i: [] for i in range(8)}
+    state = 0
+
+    consec_bar = 0
+    consec_bone = 0
+    consec_blank = 0
+
+    for i, (lbl, info) in enumerate(frame_stream, start=1):
+
+        pockets[state].append(i)
+
+        if lbl == "BAR":
+            consec_bar += 1
+            consec_bone = 0
+            consec_blank = 0
+        elif lbl == "BONE":
+            consec_bone += 1
+            consec_bar = 0
+            consec_blank = 0
+        else:
+            consec_blank += 1
+            consec_bar = 0
+            consec_bone = 0
+
+        prev_state = state
+
+        if state == 0 and consec_bone >= MIN_CONSEC_BONE:
+            state = 1
+        elif state == 1 and consec_bar >= MIN_CONSEC_BAR:
+            state = 2
+        elif state == 2 and consec_bone >= MIN_CONSEC_BONE:
+            state = 3
+        elif state == 3 and consec_bar >= MIN_CONSEC_BAR:
+            state = 4
+        elif state == 4 and consec_bone >= MIN_CONSEC_BONE:
+            state = 5
+        elif state == 5 and consec_bar >= MIN_CONSEC_BAR:
+            state = 6
+        elif state == 6 and consec_blank >= MIN_CONSEC_BLANK:
+            state = 7
+
+        logs.append((i, lbl, info, prev_state, state))
+
+    intervals = {}
+    for k, v in pockets.items():
+        intervals[k] = (v[0], v[-1]) if v else None
+
+    return intervals
+
+
+# ----------------- MAIN ----------------------
+def main():
+    if not os.path.isfile(DICOM_PATH):
+        raise FileNotFoundError(f"DICOM not found: {DICOM_PATH}")
+
+    ds = pydicom.dcmread(DICOM_PATH)
+    arr = ds.pixel_array
+
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+    if arr.ndim == 4 and arr.shape[-1] > 1:
+        arr = arr[..., 0]
+
+    n_frames = min(350, arr.shape[0])
+    print(f"[INFO] Scanning: {os.path.basename(DICOM_PATH)} ({n_frames} frames)\n")
+
+    raw_labels = []
+    infos = []
+    logs = []
+
+    for i in range(n_frames):
+        lbl, info = classify_frame_with_skeleton(arr[i])
+        raw_labels.append(lbl)
+        infos.append(info)
+
+    # --------- APPLY ADAPTIVE MULTI-VOTE FILTER ----------
+    labels = adaptive_temporal_filter(raw_labels)
+
+    intervals = collect_intervals_with_state_machine(list(zip(labels, infos)), logs)
+    BEST_BONE_FRAMES = list(range(84,88)) + list(range(215,221)) + list(range(270,281))
+
+    print("\n================ FULL 350-FRAME DIAGNOSTIC ================\n")
+    print(f"{'Frame':>4} | {'Label':>5} | {'Span':>6} | {'Angle':>6} | {'Lin':>8} | {'Grad':>7} | {'Var':>9} | {'Skel':>6} | {'Blank':>5} | Mark")
+    print("-"*115)
+
+    for i in range(n_frames):
+        lbl, info = classify_frame_with_skeleton(arr[i])
+
+        mark = ""
+        if (i+1) in BEST_BONE_FRAMES:
+            mark = "★BEST"
+        elif lbl == "BAR":
+            mark = "bar"
+        elif lbl == "BLANK":
+            mark = "blank"
+
+        print(
+            f"{i+1:4d} | {lbl:>5} | "
+            f"{info.get('span',0):6.3f} | "
+            f"{info.get('angle',0):6.2f} | "
+            f"{info.get('lin',0):8.2f} | "
+            f"{info.get('grad',0):7.3f} | "
+            f"{info.get('var',0):9.1f} | "
+            f"{info.get('skel_px',0):6d} | "
+            f"{str(info.get('blank',False)):>5} | {mark}"
+        )
+
+    names = [
+        "Bar 1", "Bone (PD4)", "Bar 2", "Bone (PD3)",
+        "Bar 3", "Bone (PD2)", "Bar 4", "Blank"
+    ]
+
+    print("\n================ FINAL INTERVAL TABLE ================\n")
+    print(f"{'Slot':<15} | Interval")
+    print("-" * 40)
+
+    for name, pocket_id in zip(names, range(8)):
+        iv = intervals[pocket_id]
+        print(f"{name:<15} | {iv if iv else 'None'}")
+
+    print("\n======================================================\n")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
++++++++++++++++++++++++++++ Working ++++++++++++++++++++++++++++++++++++++
+import numpy as np
+import cv2 as cv
+import pydicom
+import matplotlib.pyplot as plt
+
+
+def detect_bar1_regions_debug(dicom_path,
+                              start_f=1,
+                              end_f=350,
+                              roi_top_frac=0.30,
+                              roi_bottom_frac=0.70,
+                              bright_ratio=0.55,
+                              width_ratio=0.40,
+                              smooth_len=5,
+                              show_frames=[10,50,100,150,200,250]):
+    """
+    Standalone Bar-1 detector.
+    NO SAVING. Notebook-friendly visualization.
+    """
+
+    ds = pydicom.dcmread(dicom_path)
+    arr = ds.pixel_array
+
+    # Normalize to [N,H,W]
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+    if arr.ndim == 4:
+        arr = arr[..., 0]
+
+    N = arr.shape[0]
+    end_f = min(end_f, N)
+
+    frames = range(start_f - 1, end_f)
+
+    bar_mask = np.zeros(len(frames), dtype=bool)
+
+    H, W = arr.shape[1], arr.shape[2]
+    roi_y1 = int(roi_top_frac * H)
+    roi_y2 = int(roi_bottom_frac * H)
+
+    print("\nFrame | max_run | thresh | BAR")
+    print("--------------------------------")
+
+    vis_data = {}
+
+    for idx, f in enumerate(frames):
+        frame = arr[f].astype(np.float32)
+
+        # Normalize intensity
+        fmin, fmax = frame.min(), frame.max()
+        frame_n = (frame - fmin) / (fmax - fmin + 1e-6)
+
+        roi = frame_n[roi_y1:roi_y2, :]
+
+        # ----- NEW: detect empty ROI -----
+        roi_energy = np.mean(roi)
+
+        if roi_energy < 0.02:   # you can tune to 0.015–0.03
+            is_bar = True
+            max_run = 0
+            vis_mask = np.zeros_like(roi, dtype=np.uint8)
+            bar_mask[idx] = True
+            print(f"{f+1:03d}   |  EMPTY ROI |   -   | True")
+            
+            if (f+1) in show_frames:
+                vis_data[f+1] = (frame_n, vis_mask, is_bar)
+            continue
+
+        # Dynamic brightness threshold
+        thr = bright_ratio * np.max(roi)
+
+        # Compute max contiguous width of bright region
+        max_run = 0
+        vis_mask = np.zeros_like(roi, dtype=np.uint8)
+
+        for r in range(roi.shape[0]):
+            row = roi[r] > thr
+            run_len = 0
+
+            for j in range(W):
+                if row[j]:
+                    run_len += 1
+                    vis_mask[r, j] = 255
+                    max_run = max(max_run, run_len)
+                else:
+                    run_len = 0
+
+        is_bar = max_run >= width_ratio * W
+        bar_mask[idx] = is_bar
+
+        print(f"{f+1:03d}   | {max_run:7d} | {thr:.3f} | {is_bar}")
+
+        if (f+1) in show_frames:
+            vis_data[f+1] = (frame_n, vis_mask, is_bar)
+
+
+    # ---- Temporal smoothing ----
+    bar_mask_sm = bar_mask.copy()
+    k = smooth_len // 2
+
+    for i in range(len(bar_mask)):
+        window = bar_mask[max(0, i-k):min(len(bar_mask), i+k+1)]
+        bar_mask_sm[i] = np.mean(window) > 0.5
+
+    # ---- Convert to intervals ----
+    intervals = []
+    i = 0
+    while i < len(bar_mask_sm):
+        if not bar_mask_sm[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(bar_mask_sm) and bar_mask_sm[j+1]:
+            j += 1
+        intervals.append((frames[i] + 1, frames[j] + 1))
+        i = j + 1
+
+    # -------- SHOW VISUAL DEBUG --------
+    for fnum, (frame_n, vis_mask, is_bar) in vis_data.items():
+        plt.figure(figsize=(6, 6))
+        plt.title(f"Frame {fnum}  |  {'BAR' if is_bar else 'BONE'}")
+
+        vis = cv.cvtColor((frame_n * 255).astype(np.uint8), cv.COLOR_GRAY2RGB)
+
+        # ROI boundaries
+        vis[roi_y1, :, :] = [255, 255, 0]   # top ROI boundary
+        vis[roi_y2, :, :] = [0, 255, 255]   # bottom ROI boundary
+
+        # Overlay bright mask
+        mask_rgb = np.zeros_like(vis)
+        mask_rgb[roi_y1:roi_y2][vis_mask == 255] = [255, 0, 0]
+
+        overlay = cv.addWeighted(vis, 0.6, mask_rgb, 0.8, 0)
+        plt.imshow(overlay)
+        plt.axis("off")
+        plt.show()
+
+    return bar_mask_sm, intervals
+
+# ✅ RUN
+mask, ivals = detect_bar1_regions_debug(
+    "/home/ds/Desktop/Hand_dicom/K02.dcm"
+)
+
+print("\nDetected BAR-1 intervals:")
+
+# Numbered BAR intervals
+for idx, (s, e) in enumerate(ivals, start=1):
+    print(f"BAR {idx} : {s} to {e}")
+
+# -------- COMPUTE BONE INTERVALS --------
+print("\nDetected Bone intervals:")
+
+bone_id = 1
+for i in range(len(ivals) - 1):
+    bar_end   = ivals[i][1]
+    next_start = ivals[i+1][0]
+
+    bone_s = bar_end + 1
+    bone_e = next_start - 1
+
+    if bone_s <= bone_e:
+        print(f"Bone {bone_id} : {bone_s} to {bone_e}")
+        bone_id += 1
+
+
+
+
+
+
+import numpy as np
+import cv2 as cv
+import pydicom
+import matplotlib.pyplot as plt
+import os
+
+
+def detect_bar1_regions_debug(dicom_path,
+                              start_f=1,
+                              end_f=350,
+                              roi_top_frac=0.30,
+                              roi_bottom_frac=0.70,
+                              bright_ratio=0.55,
+                              width_ratio=0.40,
+                              smooth_len=5,
+                              show_frames=[x for x in range(200,350)]):
+    """
+    Standalone Bar-1 detector.
+    NO SAVING. Notebook-friendly visualization.
+    """
+
+    ds = pydicom.dcmread(dicom_path)
+    arr = ds.pixel_array
+
+    # Normalize to [N,H,W]
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+    if arr.ndim == 4:
+        arr = arr[..., 0]
+
+    N = arr.shape[0]
+    end_f = min(end_f, N)
+
+    frames = range(start_f - 1, end_f)
+
+    bar_mask = np.zeros(len(frames), dtype=bool)
+
+    H, W = arr.shape[1], arr.shape[2]
+    roi_y1 = int(roi_top_frac * H)
+    roi_y2 = int(roi_bottom_frac * H)
+
+    print("\nFrame | max_run | thresh | BAR")
+    print("--------------------------------")
+
+    vis_data = {}
+
+    for idx, f in enumerate(frames):
+        frame = arr[f].astype(np.float32)
+
+        # Normalize intensity
+        fmin, fmax = frame.min(), frame.max()
+        frame_n = (frame - fmin) / (fmax - fmin + 1e-6)
+
+        roi = frame_n[roi_y1:roi_y2, :]
+
+        # ----- NEW: detect empty ROI -----
+        roi_energy = np.mean(roi)
+
+        if roi_energy < 0.02:   # you can tune to 0.015–0.03
+            is_bar = True
+            max_run = 0
+            vis_mask = np.zeros_like(roi, dtype=np.uint8)
+            bar_mask[idx] = True
+            print(f"{f+1:03d}   |  EMPTY ROI |   -   | True")
+            
+            if (f+1) in show_frames:
+                vis_data[f+1] = (frame_n, vis_mask, is_bar)
+            continue
+
+        # Dynamic brightness threshold
+        thr = bright_ratio * np.max(roi)
+
+        # Compute max contiguous width of bright region
+        max_run = 0
+        vis_mask = np.zeros_like(roi, dtype=np.uint8)
+
+        for r in range(roi.shape[0]):
+            row = roi[r] > thr
+            run_len = 0
+
+            for j in range(W):
+                if row[j]:
+                    run_len += 1
+                    vis_mask[r, j] = 255
+                    max_run = max(max_run, run_len)
+                else:
+                    run_len = 0
+
+        #is_bar = max_run >= width_ratio * W
+        #is_bar = (max_run >= width_ratio * W) and (thr > 0.50)
+        roi_mean   = float(np.mean(roi))
+        roi_std    = float(np.std(roi))
+        roi_max    = float(np.max(roi))
+        roi_p95    = float(np.percentile(roi, 95))
+        roi_energy = roi_mean
+
+        bright_ratio_used = thr / roi_max if roi_max > 0 else 0
+        width_ratio_used  = max_run / W
+
+        is_bar = (max_run >= width_ratio * W) and (thr >= 0.52) and (max_run >= 300)
+        bar_mask[idx] = is_bar
+
+        print(f"{f+1:03d} | run={max_run:4d} {width_ratio_used:.2f} | thr={thr:.3f} | p95={roi_p95:.3f} | mean={roi_mean:.3f} | std={roi_std:.3f} | BAR={is_bar}")
+
+        if (f+1) in show_frames:
+            vis_data[f+1] = (frame_n, vis_mask, is_bar)
+
+    # ------------------------------------------
+    #  TEMPORAL REPAIR PIPELINE (C)
+    # ------------------------------------------
+
+    raw = bar_mask.copy()
+    N = len(raw)
+
+    # T1 — Neighbor fill (1 0 1 → 1 1 1)
+    filled = raw.copy()
+    for i in range(1, N-1):
+        if raw[i] == 0 and raw[i-1] == 1 and raw[i+1] == 1:
+            filled[i] = 1
+
+    # T2 — Temporal dilation (expand ±3)
+    dilated = filled.copy()
+    dilation_radius = 3
+    for i in range(N):
+        if filled[i]:
+            left  = max(0, i - dilation_radius)
+            right = min(N-1, i + dilation_radius)
+            dilated[left:right+1] = True
+
+    # T3 — Remove micro-bursts (<5 frames)
+    clean = dilated.copy()
+
+    # detect continuous segments
+    segments = []
+    i = 0
+    while i < N:
+        if clean[i] == 0:
+            i += 1
+            continue
+        j = i
+        while j+1 < N and clean[j+1] == 1:
+            j += 1
+        length = j - i + 1
+        if length < 5:           # remove tiny noisy bars
+            clean[i:j+1] = 0
+        else:
+            segments.append((i, j))
+        i = j + 1
+
+    # this is the final bar mask
+    bar_mask_final = clean
+
+
+    # ---- Convert to intervals (FINAL MASK) ----
+    intervals = []
+    i = 0
+    while i < len(bar_mask_final):
+        if not bar_mask_final[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(bar_mask_final) and bar_mask_final[j+1]:
+            j += 1
+        intervals.append((frames[i] + 1, frames[j] + 1))
+        i = j + 1
+
+
+    # -------- SHOW VISUAL DEBUG --------
+    for fnum, (frame_n, vis_mask, is_bar) in vis_data.items():
+        plt.figure(figsize=(6, 6))
+        plt.title(f"Frame {fnum}  |  {'BAR' if is_bar else 'BONE'}")
+
+        vis = cv.cvtColor((frame_n * 255).astype(np.uint8), cv.COLOR_GRAY2RGB)
+
+        # ROI boundaries
+        vis[roi_y1, :, :] = [255, 255, 0]   # top ROI boundary
+        vis[roi_y2, :, :] = [0, 255, 255]   # bottom ROI boundary
+
+        # Overlay bright mask
+        mask_rgb = np.zeros_like(vis)
+        mask_rgb[roi_y1:roi_y2][vis_mask == 255] = [255, 0, 0]
+
+        overlay = cv.addWeighted(vis, 0.6, mask_rgb, 0.8, 0)
+        plt.imshow(overlay)
+        plt.axis("off")
+        plt.show()
+
+    return bar_mask_final, intervals
+
+dicom_path = "/home/ds/Desktop/Hand_dicom/H015.dcm"
+subject_name =  os.path.splitext(os.path.basename(dicom_path))[0]
+#  RUN
+mask, ivals = detect_bar1_regions_debug(dicom_path)
+
+print("****************************")
+print(f"subject name -- {subject_name}")
+print("****************************")
+print("\nDetected BAR-1 intervals:")
+
+# Numbered BAR intervals
+for idx, (s, e) in enumerate(ivals, start=1):
+    print(f"BAR {idx} : {s} to {e}")
+
+# -------- COMPUTE BONE INTERVALS --------
+print("\nDetected Bone intervals:")
+
+bone_id = 1
+for i in range(len(ivals) - 1):
+    bar_end   = ivals[i][1]
+    next_start = ivals[i+1][0]
+
+    bone_s = bar_end + 1
+    bone_e = next_start - 1
+
+    if bone_s <= bone_e:
+        print(f"Bone {bone_id} : {bone_s} to {bone_e}")
+        bone_id += 1

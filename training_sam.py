@@ -441,12 +441,22 @@ def train(cfg):
                 label_val_total += label_loss
 
 
-                val_total += loss_dict["total_loss"].item()
+                #val_total += loss_dict["total_loss"].item()
+                total_val_loss = loss_dict["total_loss"]
+                if not torch.isnan(total_val_loss):
+                    val_total += total_val_loss.item()
+                    count += 1
+                else:
+                    print("Warning -> skipping NAN validation batch") 
                 val_dice += dice_score(pmask, gt_mask).item()
                 val_iou += iou_score(pmask, gt_mask).item()
-                count += 1
+                #count += 1
 
-        val_total /= count
+        #val_total /= count
+        if count == 0:
+            val_total = float("inf")
+        else:
+            val_total /= count
         val_dice /= count
         val_iou /= count
 

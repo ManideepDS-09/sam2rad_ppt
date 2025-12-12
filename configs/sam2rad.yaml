@@ -34,7 +34,7 @@ data:
   val_image_dir:   "/home/ds/Desktop/sam_hand/sam_hand/dataset/val"
   val_ann_path:    "/home/ds/Desktop/sam_hand/sam_hand/dataset/val/US_hand_val_coco.json"
 
-  num_classes: 1         # single-class (bone)
+  num_classes: 19         # Multi-class bone segmentation + PPN + Bone classification (19 classes)
   image_size: 1024       # SAM default
   grayscale_to_rgb: true # repeat 1→3 channel
 
@@ -67,5 +67,5 @@ losses:
   iou_loss: true
 
 save:
-  output_dir: "checkpoints_sam2rad_train_sam_b/"
+  output_dir: "checkpoints_sam2rad_train_sam_b_2/"
   save_every: 5

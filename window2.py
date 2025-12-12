@@ -18,8 +18,9 @@ import pydicom
 import cv2
 import csv
 
-from run_unet_filter_intervals import get_kept_frames
-from sam2rad_runner_copy import run_sam2rad_on_frame
+from energy_unet_intervals import get_kept_frames
+from read_dicom_sam import load_model as sam_load_model
+from read_dicom_sam import run_inference as sam_infer
 
 
 # ============================================================
@@ -199,7 +200,9 @@ class MainWindow(QWidget):
         if not self.dicom_path:
             return
 
-        # 1. UNet picks best frames per fused window
+        # -------------------------------------------------------------
+        # 1. UNet picks kept frames per bone interval
+        # -------------------------------------------------------------
         kept_list = get_kept_frames(self.dicom_path)
 
         prog = QProgressDialog("Running Pipeline…", None, 0, len(kept_list), self)
@@ -216,7 +219,6 @@ class MainWindow(QWidget):
         self.current_row = None
 
         accepted = 0
-        used_best_frames = set()   # ensured uniqueness
 
         for k, item in enumerate(kept_list):
             prog.setValue(k)
@@ -226,39 +228,32 @@ class MainWindow(QWidget):
             if not kept:
                 continue
 
-            best_frame = self.find_best_frame_from_interval(kept)
-            if best_frame is None:
-                continue
-            
+            # ---------------------------------------------------------
+            # PICK THE FINAL FRAME FOR DISPLAY
+            # ---------------------------------------------------------
+            mid_idx = len(kept) // 2
+            final_frame = kept[mid_idx]      # <--- exactly one frame per interval
 
-            # avoid duplicates
-            if best_frame in used_best_frames:
-                continue
-            used_best_frames.add(best_frame)
-
-            # Load raw frame (no mask, no overlay)
-            frame_raw = self.frames[best_frame - 1]
+            frame_raw = self.frames[final_frame - 1]
             rgb = self.to_rgb(frame_raw)
 
-            # Since SAM isn't run yet, bone count is unknown
-            # Using placeholder until Auto OR
-            n_bones = "?"
+            n_bones = "?"   # SAM not yet run
 
             row = self.table.rowCount()
             self.table.insertRow(row)
 
-            self.table.setItem(row, 0, QTableWidgetItem(str(best_frame)))
+            self.table.setItem(row, 0, QTableWidgetItem(str(final_frame)))
             self.table.setItem(row, 1, QTableWidgetItem(str(n_bones)))
             self.table.setItem(row, 2, QTableWidgetItem("—"))
-            self.table.setItem(row, 3, QTableWidgetItem("—"))  # OR Auto empty initially
+            self.table.setItem(row, 3, QTableWidgetItem("—"))
 
             self.row_items.append({
-                "best_frame": best_frame,
+                "best_frame": final_frame,
                 "bones": n_bones
             })
 
             self.sam_results[row] = {
-                "best_frame": best_frame,
+                "best_frame": final_frame,
                 "bones": n_bones,
                 "rgb": rgb
             }
@@ -272,88 +267,86 @@ class MainWindow(QWidget):
             self.table.selectRow(0)
 
         self.lbl_hint.setText(
-            "Select a row. Use slider to inspect frame. Press 'Compute Auto OR' to run SAM2Rad."
+            "Select a row. Use slider to inspect frame. Press 'Compute Auto OR'."
         )
 
-        # allow manual plotting regardless
         self.enable_manual_buttons(True)
-
-        # export CSV only if we have result rows
         self.btn_export.setEnabled(accepted > 0)
 
     def on_auto_or_all(self):
         if not self.dicom_path:
             return
 
-        from sam2rad_runner_copy import run_sam2rad_on_frame
+        # load SAM model ONCE
+        model = sam_load_model()
 
         rows = self.table.rowCount()
 
         for r in range(rows):
-            # read best frame
-            best = int(self.table.item(r, 0).text())
+            best = int(self.table.item(r, 0).text()) - 1   # 0-based index
 
-            # run SAM2Rad
-            res = run_sam2rad_on_frame(self.dicom_path, best - 1, fast_mode=True)
+            # Run read_dicom_sam OR calculation
+            out = sam_infer(model, self.dicom_path, best, save_images=False)
 
-            # --- overwrite Bones with SAM result
-            sam_bones = res.get("n_bones", None)
-            if sam_bones is not None:
-                self.table.setItem(r, 1, QTableWidgetItem(str(sam_bones)))
-                self.sam_results[r]["bones"] = sam_bones
+            # Bone count = number of components returned
+            bone_count = out.get("bone_count", None)
+            if bone_count is not None:
+                self.table.setItem(r, 1, QTableWidgetItem(str(bone_count)))
+                self.sam_results[r]["bones"] = bone_count
 
-            # --- OR values
-            or1 = res.get("or1", None)
-            or2 = res.get("or2", None)
+            # OR values
+            #or1 = out.get("OR1", None)
+            #or2 = out.get("OR2", None)
+
+            # read OR1 and OR2 using correct keys coming from read_dicom_sam.py
+            or1 = out.get("OR1 (%)", None)
+            or2 = out.get("OR2 (%)", None)
 
             txt = ""
             if or1 is not None:
-                txt += f"OR1={or1*100:.1f}% "
+                txt += f"OR1={or1:.1f}% "
             if or2 is not None:
-                txt += f"OR2={or2*100:.1f}%"
+                txt += f"OR2={or2:.1f}%"
+
+            txt = txt.strip() or "—"
+            self.table.setItem(r, 3, QTableWidgetItem(txt))
+
+            txt = ""
+            if or1 is not None:
+                txt += f"OR1={or1:.1f}% "
+            if or2 is not None:
+                txt += f"OR2={or2:.1f}%"
             txt = txt.strip() or "—"
 
-            # write into OR Auto column (col 3)
             self.table.setItem(r, 3, QTableWidgetItem(txt))
+
     
     def find_best_frame_from_interval(self, frame_list):
+        """
+        Select best frame from an interval ONLY using UNet score.
+        No SAM, no OR, no bone classification here.
+        """
         best_frame = None
-        best_score = 0
+        best_score = -1
 
         for f in frame_list:
-            # 0-based index for runner
-            res = run_sam2rad_on_frame(self.dicom_path, f - 1, fast_mode=True)
+            # 0-based indexing for frames already handled by UNet scorer
+            frame = self.frames[f - 1]
 
-            nb = res.get("n_bones", 0)
-            score = res.get("score", 0)
+            # Direct UNet confidence scoring (same logic as get_kept_frames)
+            from energy_unet_intervals import unet_score_frame   # NEW small helper you must add
 
-            # only accept 1 or 2 bones
-            if nb < 1 or nb > 5:
-                continue
+            score = unet_score_frame(frame)
 
-            # keep best confidence
             if score > best_score:
                 best_score = score
                 best_frame = f
 
-            # EARLY EXIT if strong confidence
-            if score > 0.80 and nb == 2:
-                best_frame = f
-                break
-
-        # drop interval if no candidate found
-        if best_frame is None:
-            return None
-
-        # optional safety threshold
-        if best_score < 0.40:
+        # safety threshold
+        if best_frame is None or best_score < 0.40:
             return None
 
         return best_frame
-
-
-
-
 
     # ============================================================
     def enable_manual_buttons(self, flag: bool):
