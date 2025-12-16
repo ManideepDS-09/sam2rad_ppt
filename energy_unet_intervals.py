@@ -12,12 +12,12 @@ from energy_intervals import detect_bar1_regions_debug
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 IMG_H, IMG_W = 480, 640
-PAD = 2
-THR = 0.4
+PAD = 0
+THR = 0.6
 MAX_WORKERS = 8
 
 # Default paths (edit if needed)
-DICOM_PATH = "/home/ds/Desktop/Hand_dicom/K10.dcm"
+DICOM_PATH = "/home/ds/Desktop/Hand_dicom/V13.dcm"
 UNET_WTS   = "/home/ds/Desktop/SAM_HAND_FINAL/trained_weights/unet_bones_best.pth"
 
 # -------- UNET ----------
