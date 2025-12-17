@@ -5,6 +5,101 @@ import pydicom
 import matplotlib.pyplot as plt
 import os
 
+def analyze_bone_interval(arr, bone_interval,
+                          roi_y1, roi_y2,
+                          sustain_k=5,
+                          onset_frac=0.65):
+    """
+    Analyze one bone interval and find onset-based bone frame
+    """
+
+    s, e = bone_interval
+    scores = []
+
+    print(f"\nBone interval {s}–{e}")
+    print("frame | mean_energy")
+
+    if e - s + 1 <= 2:
+        print(f"--> Trivial interval, using center frame {s}")
+        print(f"--> Window: [{s} , {s}]")
+        return s
+
+    for f in range(s-1, e):   # 0-based
+        frame = arr[f].astype(np.float32)
+
+        fmin, fmax = frame.min(), frame.max()
+        frame_n = (frame - fmin) / (fmax - fmin + 1e-6)
+
+        roi = frame_n[roi_y1:roi_y2, :]
+        energy = float(np.mean(roi))
+
+        scores.append(energy)
+        print(f"{f+1:5d} | {energy:8.5f}")
+
+    scores = np.array(scores)
+    ENERGY_FLOOR = 0.05
+
+    if scores.max() < ENERGY_FLOOR:
+        print(f"--> Dropped interval (low energy): max={scores.max():.4f}")
+        return None
+    N = len(scores)
+
+    # --- temporal derivative ---
+    dE = np.zeros_like(scores)
+    if N > 2:
+        dE[1:-1] = np.abs(scores[2:] - scores[:-2]) / 2
+        dE[0] = dE[1]
+        dE[-1] = dE[-2]
+    else:
+        dE[:] = 0
+
+    # --- thresholds (SUBJECT RELATIVE, NOT ABSOLUTE) ---
+    HIGH_ENERGY_THR = 0.85 * np.percentile(scores, 95)
+    FLAT_THR = np.percentile(dE, 40)   # low variation
+
+    mask = (scores >= HIGH_ENERGY_THR) & (dE <= FLAT_THR)
+
+    idxs = np.where(mask)[0]
+
+    if len(idxs) > 0:
+        segments = np.split(
+            idxs,
+            np.where(np.diff(idxs) != 1)[0] + 1
+        )
+
+        # choose longest flat high-energy band
+        # reject bands hugging interval edges
+        VALID_MARGIN = 0.15 * (e - s + 1)
+
+        valid_segs = []
+        for seg in segments:
+            seg_start = s + seg[0]
+            seg_end   = s + seg[-1]
+            if (seg_start - s) > VALID_MARGIN and (e - seg_end) > VALID_MARGIN:
+                valid_segs.append(seg)
+
+        if len(valid_segs) > 0:
+            # Prefer band closest to next bar (late bone region)
+            best_seg = max(
+                valid_segs,
+                key=lambda seg: (seg[-1])   # highest frame index
+            )
+        else:
+            best_seg = max(segments, key=len)
+
+
+        seg_start = s + best_seg[0]
+        seg_end   = s + best_seg[-1]
+
+        center = (seg_start + seg_end) // 2
+
+        print(f"--> Flat high-energy band: [{seg_start} , {seg_end}]")
+        print(f"--> Output window: [{center-10} , {center+10}]")
+    else:
+        center = s + np.argmax(scores)
+        print(f"--> Fallback window: [{center-10} , {center+10}]")
+
+    return center
 
 def detect_bar1_regions_debug(dicom_path,
                               start_f=1,
@@ -61,7 +156,7 @@ def detect_bar1_regions_debug(dicom_path,
         # ----- NEW: detect empty ROI -----
         roi_energy = np.mean(roi)
 
-        if roi_energy < 0.015:   # you can tune to 0.015–0.03
+        if roi_energy < 0.02:   # you can tune to 0.015–0.03
             is_bar = True
             max_run = 0
             vis_mask = np.zeros_like(roi, dtype=np.uint8)
@@ -180,7 +275,29 @@ def detect_bar1_regions_debug(dicom_path,
 
         if bone_s <= bone_e:
             bone_intervals.append((bone_s, bone_e))
+    
+    print("\nBone interval | bone frames interval")
 
+    final_bone_frame_intervals = []
+
+    for (bone_s, bone_e) in bone_intervals:
+        center = analyze_bone_interval(
+            arr,
+            (bone_s, bone_e),
+            roi_y1,
+            roi_y2,
+            sustain_k=5,
+            onset_frac=0.65
+        )
+
+        if center is None:
+            continue
+
+        win_s = max(bone_s, center - 10)
+        win_e = min(bone_e, center + 10)
+
+        print(f"{bone_s}-{bone_e} | {win_s}-{win_e}")
+        final_bone_frame_intervals.append((win_s, win_e))
 
 
     # -------- SHOW VISUAL DEBUG --------
@@ -203,7 +320,7 @@ def detect_bar1_regions_debug(dicom_path,
         #plt.axis("off")
         #plt.show()
 
-    return bar_mask_final, intervals, bone_intervals
+    return bar_mask_final, intervals, final_bone_frame_intervals
 
 def get_bone_intervals(dicom_path):
     mask, bar_intervals, bone_intervals = detect_bar1_regions_debug(dicom_path)
