@@ -72,6 +72,7 @@ class MainWindow(QWidget):
 
         self.current_row = None
         self.preloaded = None
+        self.user_overrode_frame = False
 
         # ---------- UI ----------
         main = QHBoxLayout(self)
@@ -101,13 +102,23 @@ class MainWindow(QWidget):
 
 
         # table: Best Frame | Bones | OR Manual
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Best Frame", "Bones", "OR Manual", "OR Auto"])
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Best Frame", "OR Manual", "OR Auto"])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.itemSelectionChanged.connect(self.on_row_selected)
         left.addWidget(self.table)
+
+        # ---------------- MANUAL FRAME TABLE ----------------
+        self.manual_label = QLabel("Manual Frames")
+        left.addWidget(self.manual_label)
+
+        self.manual_table = QTableWidget(0, 2)
+        self.manual_table.setHorizontalHeaderLabels(["Manual Frame", "OR (%)"])
+        self.manual_table.horizontalHeader().setStretchLastSection(True)
+        self.manual_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        left.addWidget(self.manual_table)
 
         main.addLayout(left, 3)
 
@@ -151,6 +162,19 @@ class MainWindow(QWidget):
 
         # enable manual point clicks
         self.viewer.mousePressEvent = self.on_image_click
+
+    # ============================================================
+    # MANUAL FRAME RESULT HELPER
+    # ============================================================
+    def add_manual_result(self, frame, or_text):
+        """
+        Append a manual frame + OR result to the Manual Frames table.
+        Does NOT touch auto-selected rows.
+        """
+        r = self.manual_table.rowCount()
+        self.manual_table.insertRow(r)
+        self.manual_table.setItem(r, 0, QTableWidgetItem(str(frame)))
+        self.manual_table.setItem(r, 1, QTableWidgetItem(or_text))
 
     # ============================================================
     # LOAD DICOM
@@ -259,6 +283,33 @@ class MainWindow(QWidget):
             }
 
             accepted += 1
+            # ---------------- to print all the frames to the widow -----------#
+            #for final_frame in kept:
+            #    frame_raw = self.frames[final_frame - 1]
+            #    rgb = self.to_rgb(frame_raw)
+
+            #    n_bones = "?"   # SAM not yet run
+
+            #    row = self.table.rowCount()
+            #    self.table.insertRow(row)
+
+            #    self.table.setItem(row, 0, QTableWidgetItem(str(final_frame)))
+            #    self.table.setItem(row, 1, QTableWidgetItem(str(n_bones)))
+            #    self.table.setItem(row, 2, QTableWidgetItem("—"))
+            #    self.table.setItem(row, 3, QTableWidgetItem("—"))
+
+            #    self.row_items.append({
+            #        "best_frame": final_frame,
+            #        "bones": n_bones
+            #    })
+
+            #    self.sam_results[row] = {
+            #        "best_frame": final_frame,
+            #        "bones": n_bones,
+            #        "rgb": rgb
+            #    }
+
+            #    accepted += 1
 
         prog.setValue(len(kept_list))
         QApplication.processEvents()
@@ -370,7 +421,11 @@ class MainWindow(QWidget):
         best = data["best_frame"]
         n_b = data["bones"]
 
-        self.frame_slider.setValue(best)  # triggers on_slider_changed → show_frame
+        #self.frame_slider.setValue(best)  # triggers on_slider_changed → show_frame
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setValue(best)
+        self.frame_slider.blockSignals(False)
+        self.show_frame(best)
 
         allowed = self.required_points(n_b)
 
@@ -408,29 +463,44 @@ class MainWindow(QWidget):
         self.lbl_frame.setText(f"Frame: {idx} / {n}")
         self.scene.update()
 
+    #def show_frame(self, idx):
+    #    """Show a frame; if it's the current best-frame, overlay points."""
+    #    if self.frames is None:
+    #        return
+
+    #    n = self.frames.shape[0]
+    #    idx = max(1, min(idx, n))
+
+        # If this is the current row's best frame, show with overlay
+    #    if self.current_row is not None and self.current_row in self.sam_results:
+    #        data = self.sam_results[self.current_row]
+    #        best = data["best_frame"]
+    #        if idx == best:
+    #            pts = []
+    #            if self.current_row in self.manual_or_cache:
+    #                pts = self.manual_or_cache[self.current_row].get("pts", [])
+    #            self.overlay(pts)
+    #            return
     def show_frame(self, idx):
-        """Show a frame; if it's the current best-frame, overlay points."""
         if self.frames is None:
             return
 
         n = self.frames.shape[0]
         idx = max(1, min(idx, n))
 
-        # If this is the current row's best frame, show with overlay
-        if self.current_row is not None and self.current_row in self.sam_results:
-            data = self.sam_results[self.current_row]
-            best = data["best_frame"]
-            if idx == best:
-                pts = []
-                if self.current_row in self.manual_or_cache:
-                    pts = self.manual_or_cache[self.current_row].get("pts", [])
-                self.overlay(pts)
-                return
+        pts = []
+        key = (self.current_row, idx)
+        if key in self.manual_or_cache:
+            pts = self.manual_or_cache[key].get("pts", [])
 
-        # otherwise, just show raw frame
         frame_raw = self.frames[idx - 1]
         rgb = self.to_rgb(frame_raw)
+
+        for (x, y) in pts:
+            cv2.circle(rgb, (int(x), int(y)), 6, (0, 0, 255), -1)
+
         self.display_rgb(rgb, idx, n)
+
 
     def on_slider_changed(self, v):
         """Slider → show corresponding frame, with overlay if applicable."""
@@ -443,21 +513,37 @@ class MainWindow(QWidget):
     # ============================================================
     # OVERLAY POINTS ON BEST FRAME
     # ============================================================
+    #def overlay(self, pts):
+    #    if self.current_row is None:
+    #        return
+    #    if self.current_row not in self.sam_results:
+    #        return
+
+    #    data = self.sam_results[self.current_row]
+    #    best = data["best_frame"]
+    #    rgb = data["rgb"].copy()
+
+    #    for (x, y) in pts:
+    #        cv2.circle(rgb, (int(x), int(y)), 6, (0, 0, 255), -1)
+
+    #    n = self.frames.shape[0]
+    #    self.display_rgb(rgb, best, n)
     def overlay(self, pts):
         if self.current_row is None:
             return
         if self.current_row not in self.sam_results:
             return
 
-        data = self.sam_results[self.current_row]
-        best = data["best_frame"]
-        rgb = data["rgb"].copy()
+        current_frame = self.frame_slider.value()
+        frame_raw = self.frames[current_frame - 1]
+        rgb = self.to_rgb(frame_raw)
 
         for (x, y) in pts:
             cv2.circle(rgb, (int(x), int(y)), 6, (0, 0, 255), -1)
 
         n = self.frames.shape[0]
-        self.display_rgb(rgb, best, n)
+        self.display_rgb(rgb, current_frame, n)
+
 
     # ============================================================
     # IMAGE CLICK → COLLECT POINTS
@@ -470,10 +556,11 @@ class MainWindow(QWidget):
 
         data = self.sam_results[self.current_row]
         best = data["best_frame"]
+        current_frame = self.frame_slider.value()
 
         # only allow clicking on that row's best frame
-        if self.frame_slider.value() != best:
-            return
+        #if self.frame_slider.value() != best:
+        #    return
 
         pos = self.viewer.mapToScene(ev.pos())
         x, y = pos.x(), pos.y()
@@ -483,12 +570,17 @@ class MainWindow(QWidget):
         if not (0 <= x < W and 0 <= y < H):
             return
 
-        rec = self.manual_or_cache.get(self.current_row, {"pts": []})
-        pts = rec.get("pts", [])
+        #rec = self.manual_or_cache.get(self.current_row, {"pts": []})
+        key = (self.current_row, current_frame)
+        rec = self.manual_or_cache.get(key, {"pts": []})
+        #pts = rec.get("pts", [])
+        pts = rec["pts"]
+        self.manual_or_cache[key] = {"pts": pts}
 
         allowed = self.required_points(data["bones"])
         pts.append((x, y))
-        self.manual_or_cache[self.current_row] = {"pts": pts}
+        #self.manual_or_cache[self.current_row] = {"pts": pts}
+        self.manual_or_cache[key] = {"pts": pts}
         self.overlay(pts)
 
         if len(pts) in allowed:
@@ -510,36 +602,65 @@ class MainWindow(QWidget):
     # ============================================================
     # UNDO / CLEAR
     # ============================================================
+    #def on_manual_undo(self):
+    #    if self.current_row is None:
+    #        return
+    #    if self.current_row not in self.manual_or_cache:
+    #        return
+
+    #    pts = self.manual_or_cache[self.current_row].get("pts", [])
+    #    if not pts:
+    #        return
+
+    #    pts.pop()
+    #    self.manual_or_cache[self.current_row] = {"pts": pts}
+    #    self.table.setItem(self.current_row, 2, QTableWidgetItem("—"))
+    #    self.overlay(pts)
     def on_manual_undo(self):
         if self.current_row is None:
             return
-        if self.current_row not in self.manual_or_cache:
+
+        key = (self.current_row, self.frame_slider.value())
+        if key not in self.manual_or_cache:
             return
 
-        pts = self.manual_or_cache[self.current_row].get("pts", [])
+        pts = self.manual_or_cache[key]["pts"]
         if not pts:
             return
 
         pts.pop()
-        self.manual_or_cache[self.current_row] = {"pts": pts}
-        self.table.setItem(self.current_row, 2, QTableWidgetItem("—"))
+        self.manual_or_cache[key]["pts"] = pts
         self.overlay(pts)
 
+#    def on_manual_clear(self):
+#        if self.current_row is None:
+#            return
+#        if self.current_row not in self.manual_or_cache:
+#            return
+
+        #self.manual_or_cache[self.current_row] = {"pts": []}
+        #self.table.setItem(self.current_row, 2, QTableWidgetItem("—"))
+        #self.overlay([])
     def on_manual_clear(self):
         if self.current_row is None:
             return
-        if self.current_row not in self.manual_or_cache:
+
+        key = (self.current_row, self.frame_slider.value())
+        if key not in self.manual_or_cache:
             return
 
-        self.manual_or_cache[self.current_row] = {"pts": []}
+        self.manual_or_cache[key] = {"pts": []}
         self.table.setItem(self.current_row, 2, QTableWidgetItem("—"))
         self.overlay([])
+
 
     # ============================================================
     # MANUAL OR COMPUTE
     # ============================================================
     def compute_manual_OR(self, row):
-        pts = self.manual_or_cache[row].get("pts", [])
+        key = (row, self.frame_slider.value())
+        #pts = self.manual_or_cache[row].get("pts", [])
+        pts = self.manual_or_cache.get(key, {}).get("pts", [])
         if len(pts) not in (3, 6):
             return
 
@@ -575,9 +696,25 @@ class MainWindow(QWidget):
             txt += f"OR2={OR2*100:.1f}%"
         txt = txt.strip() or "—"
 
-        self.table.setItem(row, 2, QTableWidgetItem(txt))
-        self.manual_or_cache[row]["OR1"] = OR1
-        self.manual_or_cache[row]["OR2"] = OR2
+        #self.table.setItem(row, 2, QTableWidgetItem(txt))
+        #frame = self.frame_slider.value()
+        #self.add_manual_result(frame, txt)
+        #self.manual_or_cache[row]["OR1"] = OR1
+        #self.manual_or_cache[row]["OR2"] = OR2
+        current_frame = self.frame_slider.value()
+        auto_frame = self.sam_results[row]["best_frame"]
+
+        # Case 1: manual points on auto-selected frame
+        if current_frame == auto_frame:
+            # update TOP table
+            self.table.setItem(row, 1, QTableWidgetItem(txt))  # OR Manual column
+            self.manual_or_cache[key]["OR1"] = OR1
+            self.manual_or_cache[key]["OR2"] = OR2
+
+        # Case 2: manual override frame
+        else:
+            # update Manual Frames table only
+            self.add_manual_result(current_frame, txt)
 
         print(f"[MANUAL] Row {row} → {txt}")
 
