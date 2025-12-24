@@ -65,7 +65,7 @@ def analyze_bone_interval(arr, bone_interval,
 
     # --- thresholds (SUBJECT RELATIVE, NOT ABSOLUTE) ---
     HIGH_ENERGY_THR = 0.85 * np.percentile(scores, 95)
-    FLAT_THR = np.percentile(dE, 55)   # low variation
+    FLAT_THR = np.percentile(dE, 40)   # low variation
     #print("HIGH_ENERGY_THR =", HIGH_ENERGY_THR)
     #print("FLAT_THR =", FLAT_THR)
 
@@ -109,10 +109,13 @@ def analyze_bone_interval(arr, bone_interval,
         VALID_MARGIN = 0.15 * (e - s + 1)
 
         valid_segs = []
+        L = e - s + 1
+        LATE_START = int(0.70 * L)
         for seg in segments:
             seg_start = s + seg[0]
             seg_end   = s + seg[-1]
-            if (seg_start - s) > VALID_MARGIN and (e - seg_end) > VALID_MARGIN:
+            # keep if fully internal OR overlaps late bone region
+            if ((seg_start - s) > VALID_MARGIN and (e - seg_end) > VALID_MARGIN) or (seg_end - s >= LATE_START):
                 valid_segs.append(seg)
 
         if len(valid_segs) > 0:
@@ -135,6 +138,20 @@ def analyze_bone_interval(arr, bone_interval,
     else:
         center = s + np.argmax(scores)
         #print(f"--> Fallback window: [{center-10} , {center+10}]")
+
+    # ---- late-bone correction ----
+    L = e - s + 1
+    if L >= 80:
+        late_frac = 0.70
+        late_start = s + int(late_frac * L)
+
+        if center < late_start:
+            # choose flattest frame in late region
+            late_idxs = np.where(np.arange(len(scores)) + s >= late_start)[0]
+            if len(late_idxs) > 0:
+                late_dE = dE[late_idxs]
+                late_center_idx = late_idxs[np.argmin(late_dE)]
+                center = s + late_center_idx
 
     return center
 
@@ -363,7 +380,7 @@ def detect_bar1_regions_debug(dicom_path,
 #    mask, bar_intervals, bone_intervals = detect_bar1_regions_debug(dicom_path)
 #    return bone_intervals
 
-dicom_path = "/home/ds/Desktop/Hand_dicom/K07.dcm"
+dicom_path = "/home/ds/Desktop/Hand_dicom/K13.dcm"
 subject_name =  os.path.splitext(os.path.basename(dicom_path))[0]
 
 mask, ivals, bone_intervals = detect_bar1_regions_debug(dicom_path)

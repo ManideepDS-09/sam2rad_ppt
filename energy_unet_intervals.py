@@ -17,7 +17,7 @@ THR = 0.6
 MAX_WORKERS = 8
 
 # Default paths (edit if needed)
-DICOM_PATH = "/home/ds/Desktop/Hand_dicom/V13.dcm"
+DICOM_PATH = "/home/ds/Desktop/Hand_dicom/K11.dcm"
 UNET_WTS   = "/home/ds/Desktop/SAM_HAND_FINAL/trained_weights/unet_bones_best.pth"
 
 # -------- UNET ----------
@@ -104,9 +104,9 @@ def get_kept_frames(
     # bone_intervals are 1-based frame indices (s,e)
     # --------------------------------------------------------
     print(f"[INFO] Getting bone intervals from energy_intervals.py for: {dicom_path}")
-    _, bar_intervals, bone_intervals = detect_bar1_regions_debug(dicom_path)
+    _, bar_intervals, final_bone_frame_intervals, bone_intervals = detect_bar1_regions_debug(dicom_path)
 
-    intervals = bone_intervals  # list of (s,e) in 1-based indexing
+    intervals = bone_intervals
 
     kept_per_interval = []
 
@@ -114,19 +114,25 @@ def get_kept_frames(
         # expand, but clamp to valid frame range
         s2, e2 = max(1, s - pad), min(n_frames, e + pad)
         idxs = list(range(s2, e2 + 1))
+        
+        interval_center = 0.5 * (s + e)
+        half_len = max(1.0, 0.5 * (e - s))
 
         scored = []  # (score, frame_idx)
-
         # score all frames in this expanded interval
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futs = {ex.submit(infer_score, model, frames[i - 1]): i for i in idxs}
             for fut in as_completed(futs):
                 i = futs[fut]
                 score = fut.result()
-                scored.append((score, i))
+                # distance from bone center (normalized 0..1)
+                dist = abs(i - interval_center) / half_len
+                # center-biased score (small, smooth penalty)
+                weighted_score = score * (1.0 - 0.35 * dist)
+                scored.append((weighted_score, score, i))
 
         # reject low-confidence frames
-        scored = [(sc, fr) for (sc, fr) in scored if sc >= min_thr]
+        scored = [(wsc, sc, fr) for (wsc, sc, fr) in scored if sc >= min_thr]
 
         if not scored:
             # entire interval is too weak → drop
@@ -139,10 +145,9 @@ def get_kept_frames(
 
         # sort by score desc
         scored.sort(key=lambda x: x[0], reverse=True)
-
         # take top_k only
         top = scored[:top_k]
-        kept = sorted([fr for (_, fr) in top])
+        kept = sorted([fr for (_, _, fr) in top])
 
         kept_per_interval.append({
             "interval": (s, e),   # original bone interval

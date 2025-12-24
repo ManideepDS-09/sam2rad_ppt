@@ -16,12 +16,12 @@ def analyze_bone_interval(arr, bone_interval,
     s, e = bone_interval
     scores = []
 
-    print(f"\nBone interval {s}–{e}")
-    print("frame | mean_energy")
+    #print(f"\nBone interval {s}–{e}")
+    #print("frame | mean_energy")
 
     if e - s + 1 <= 2:
-        print(f"--> Trivial interval, using center frame {s}")
-        print(f"--> Window: [{s} , {s}]")
+        #print(f"--> Trivial interval, using center frame {s}")
+        #print(f"--> Window: [{s} , {s}]")
         return s
 
     for f in range(s-1, e):   # 0-based
@@ -34,18 +34,28 @@ def analyze_bone_interval(arr, bone_interval,
         energy = float(np.mean(roi))
 
         scores.append(energy)
-        print(f"{f+1:5d} | {energy:8.5f}")
+        #print(f"{f+1:5d} | {energy:8.5f}")
 
     scores = np.array(scores)
+    # DEBUG — inspect manual-region behavior
+    #print("\n[DEBUG] interval:", s, e)
+    #print("scores.max =", scores.max())
+    #print("scores[late] sample:")
+
+    late_idxs = range(int(0.6 * len(scores)), len(scores))
+    #for i in list(late_idxs)[:5]:
+        #print(f" idx {i} frame {s+i} energy {scores[i]:.5f}")
+
     ENERGY_FLOOR = 0.05
 
     if scores.max() < ENERGY_FLOOR:
-        print(f"--> Dropped interval (low energy): max={scores.max():.4f}")
+        #print(f"--> Dropped interval (low energy): max={scores.max():.4f}")
         return None
     N = len(scores)
 
     # --- temporal derivative ---
     dE = np.zeros_like(scores)
+    #print("dE stats:", np.percentile(dE, [20, 40, 60, 80]))
     if N > 2:
         dE[1:-1] = np.abs(scores[2:] - scores[:-2]) / 2
         dE[0] = dE[1]
@@ -56,10 +66,37 @@ def analyze_bone_interval(arr, bone_interval,
     # --- thresholds (SUBJECT RELATIVE, NOT ABSOLUTE) ---
     HIGH_ENERGY_THR = 0.85 * np.percentile(scores, 95)
     FLAT_THR = np.percentile(dE, 40)   # low variation
+    #print("HIGH_ENERGY_THR =", HIGH_ENERGY_THR)
+    #print("FLAT_THR =", FLAT_THR)
+
 
     mask = (scores >= HIGH_ENERGY_THR) & (dE <= FLAT_THR)
 
     idxs = np.where(mask)[0]
+
+    #print("mask count =", np.sum(mask))
+    #if np.sum(mask) > 0:
+        #print("mask min frame =", s + idxs.min())
+        #print("mask max frame =", s + idxs.max())
+
+    # -------------------------------------------------
+    # FALLBACK: if we only find an early band, relax energy
+    # to capture the later stable region.
+    # -------------------------------------------------
+    L_int = (e - s + 1)
+    late_start_idx = int(0.55 * (L_int - 1))   # focus on latter half
+
+    # If mask finds nothing OR it finds only early indices, relax energy threshold
+    if (len(idxs) == 0) or (np.max(idxs) < late_start_idx):
+        HIGH_ENERGY_THR2 = np.percentile(scores, 70)   # relaxed energy
+        FLAT_THR2 = np.percentile(dE, 50)              # relaxed flatness
+
+        mask2 = (scores >= HIGH_ENERGY_THR2) & (dE <= FLAT_THR2)
+        idxs2 = np.where(mask2)[0]
+
+        # If relaxed mask gives us later candidates, use them
+        if len(idxs2) > 0:
+            idxs = idxs2
 
     if len(idxs) > 0:
         segments = np.split(
@@ -72,17 +109,20 @@ def analyze_bone_interval(arr, bone_interval,
         VALID_MARGIN = 0.15 * (e - s + 1)
 
         valid_segs = []
+        L = e - s + 1
+        LATE_START = int(0.70 * L)
         for seg in segments:
             seg_start = s + seg[0]
             seg_end   = s + seg[-1]
-            if (seg_start - s) > VALID_MARGIN and (e - seg_end) > VALID_MARGIN:
+            # keep if fully internal OR overlaps late bone region
+            if ((seg_start - s) > VALID_MARGIN and (e - seg_end) > VALID_MARGIN) or (seg_end - s >= LATE_START):
                 valid_segs.append(seg)
 
         if len(valid_segs) > 0:
             # Prefer band closest to next bar (late bone region)
             best_seg = max(
                 valid_segs,
-                key=lambda seg: (seg[-1])   # highest frame index
+                key=lambda seg: (len(seg),seg[-1])
             )
         else:
             best_seg = max(segments, key=len)
@@ -93,11 +133,25 @@ def analyze_bone_interval(arr, bone_interval,
 
         center = (seg_start + seg_end) // 2
 
-        print(f"--> Flat high-energy band: [{seg_start} , {seg_end}]")
-        print(f"--> Output window: [{center-10} , {center+10}]")
+        #print(f"--> Flat high-energy band: [{seg_start} , {seg_end}]")
+        #print(f"--> Output window: [{center-10} , {center+10}]")
     else:
         center = s + np.argmax(scores)
-        print(f"--> Fallback window: [{center-10} , {center+10}]")
+        #print(f"--> Fallback window: [{center-10} , {center+10}]")
+
+    # ---- late-bone correction ----
+    L = e - s + 1
+    if L >= 80:
+        late_frac = 0.70
+        late_start = s + int(late_frac * L)
+
+        if center < late_start:
+            # choose flattest frame in late region
+            late_idxs = np.where(np.arange(len(scores)) + s >= late_start)[0]
+            if len(late_idxs) > 0:
+                late_dE = dE[late_idxs]
+                late_center_idx = late_idxs[np.argmin(late_dE)]
+                center = s + late_center_idx
 
     return center
 
@@ -276,7 +330,7 @@ def detect_bar1_regions_debug(dicom_path,
         if bone_s <= bone_e:
             bone_intervals.append((bone_s, bone_e))
     
-    print("\nBone interval | bone frames interval")
+    #print("\nBone interval | Reduced bone frames interval")
 
     final_bone_frame_intervals = []
 
@@ -320,10 +374,10 @@ def detect_bar1_regions_debug(dicom_path,
         #plt.axis("off")
         #plt.show()
 
-    return bar_mask_final, intervals, final_bone_frame_intervals
+    return bar_mask_final, intervals, final_bone_frame_intervals, bone_intervals
 
 def get_bone_intervals(dicom_path):
-    mask, bar_intervals, bone_intervals = detect_bar1_regions_debug(dicom_path)
+    mask, bar_intervals,final_bone_frame_intervals, bone_intervals = detect_bar1_regions_debug(dicom_path)
     return bone_intervals
 
 #dicom_path = "/home/ds/Desktop/Hand_dicom/H048.dcm"
