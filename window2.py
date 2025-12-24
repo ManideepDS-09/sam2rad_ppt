@@ -29,7 +29,9 @@ from read_dicom_sam import run_inference as sam_infer
 class ZoomableGraphicsView(QGraphicsView):
     def __init__(self):
         super().__init__()
-        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        #self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setDragMode(QGraphicsView.NoDrag)
+        self.setCursor(Qt.ArrowCursor)
         self._zoom = 0
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
 
@@ -497,7 +499,7 @@ class MainWindow(QWidget):
         rgb = self.to_rgb(frame_raw)
 
         for (x, y) in pts:
-            cv2.circle(rgb, (int(x), int(y)), 6, (0, 0, 255), -1)
+            cv2.circle(rgb, (int(x), int(y)), 3, (255, 0, 0), -1)
 
         self.display_rgb(rgb, idx, n)
 
@@ -539,7 +541,7 @@ class MainWindow(QWidget):
         rgb = self.to_rgb(frame_raw)
 
         for (x, y) in pts:
-            cv2.circle(rgb, (int(x), int(y)), 6, (0, 0, 255), -1)
+            cv2.circle(rgb, (int(x), int(y)), 3, (255, 0, 0), -1)
 
         n = self.frames.shape[0]
         self.display_rgb(rgb, current_frame, n)
