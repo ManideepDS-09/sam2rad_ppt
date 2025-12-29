@@ -140,6 +140,38 @@ def compute_OR_from_components(comps, rgb, out_path):
     if len(bones) == 3:
         A, B, C = bones
 
+        # -------------------------------------------------
+        # BIG-BONE GUARD: skip OR if all 3 bones are large
+        # -------------------------------------------------
+        area_A = A.sum()
+        area_B = B.sum()
+        area_C = C.sum()
+
+        VERY_BIG_AREA = 25000  # <-- tune once if needed
+
+        if (
+            area_A >= VERY_BIG_AREA and
+            area_B >= VERY_BIG_AREA and
+            area_C >= VERY_BIG_AREA
+        ):
+            # mark OR as not applicable
+            OR1 = None
+            h1 = None
+            H1 = None
+            H1_star = None
+
+            # optionally store a reason (useful for debug / logs)
+            skip_reason = "3 large bones → OR skipped"
+
+            # IMPORTANT: exit this block cleanly
+            return {
+                "OR1": None,
+                "h1": None,
+                "H1": None,
+                "H1_star": None,
+                "skip_reason": skip_reason
+            }
+
         pA_L, pA_R = get_bounding_points(A)
         pB_L, pB_R = get_bounding_points(B)
         pC_L, pC_R = get_bounding_points(C)
@@ -400,19 +432,19 @@ def compute_OR_from_components(comps, rgb, out_path):
     # ---------------- overlay text -----------------
     ytxt = 20
     if OR1 is not None:
-        cv2.putText(vis,f"OR1={OR1*100:.1f}%",(10,ytxt),
+        cv2.putText(vis,f"OR1={OR1:.1f}%",(10,ytxt),
                     cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,0,255),1)
     ytxt+=20
     if OR2 is not None:
-        cv2.putText(vis,f"OR2={OR2*100:.1f}%",(10,ytxt),
+        cv2.putText(vis,f"OR2={OR2:.1f}%",(10,ytxt),
                     cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,0,255),1)
     ytxt+=20
     if OR1_star is not None:
-        cv2.putText(vis,f"OR1*={OR1_star*100:.1f}%",(10,ytxt),
+        cv2.putText(vis,f"OR1*={OR1_star:.1f}%",(10,ytxt),
                     cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,128,255),1)
     ytxt+=20
     if OR2_star is not None:
-        cv2.putText(vis,f"OR2*={OR2_star*100:.1f}%",(10,ytxt),
+        cv2.putText(vis,f"OR2*={OR2_star:.1f}%",(10,ytxt),
                     cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,128,255),1)
 
     # only save if a valid out_path is provided

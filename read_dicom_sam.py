@@ -15,6 +15,8 @@ from OR_auto_calculator import (
     compute_OR_from_components,
     MIN_COMP_AREA
 )
+def get_subject_name(dicom_path):
+    return os.path.splitext(os.path.basename(dicom_path))[0]
 
 # -------------------------------------------------
 # CLASS MAP (must match training)
@@ -103,7 +105,7 @@ def preprocess_frame(frame_uint8):
 # -------------------------------------------------
 # Inference + OR
 # -------------------------------------------------
-def run_inference(model, dicom_path, frame_idx, save_images=True):
+#def run_inference(model, dicom_path, frame_idx, save_images=True):
 
     frame = load_dicom_frame(dicom_path, frame_idx)
     tensor, rgb = preprocess_frame(frame)
@@ -206,7 +208,7 @@ def run_inference(model, dicom_path, frame_idx, save_images=True):
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,                # scale
             (0, 255, 255),      # yellow
-            2,                  # thickness
+            6,                  # thickness
             cv2.LINE_AA
         )
 
@@ -330,13 +332,100 @@ def run_inference(model, dicom_path, frame_idx, save_images=True):
     print("===========================\n")
 
     return or_res
+def run_inference(model, dicom_path, frame_idx, save_images=True):
+
+    subject = get_subject_name(dicom_path)
+
+    print("\n=============== SAM2Rad RUN ===============")
+    print(f"Subject: {subject}")
+    print(f"Frame: {frame_idx}")
+    print("===========================================\n")
+
+    # -------------------------------------------------
+    # LOAD FRAME
+    # -------------------------------------------------
+    ds = pydicom.dcmread(dicom_path)
+    arr = ds.pixel_array
+    frame = arr[frame_idx].astype(np.uint8)
+
+    # normalize
+    f = frame.astype(np.float32)
+    f = (f - f.min()) / max(f.max() - f.min(), 1e-6)
+    f = (f * 255).astype(np.uint8)
+
+    resized = cv2.resize(f, (1024, 1024))
+    rgb = cv2.cvtColor(resized, cv2.COLOR_GRAY2RGB)
+    tensor = to_tensor(rgb).unsqueeze(0).to(DEVICE)
+
+    # -------------------------------------------------
+    # INFERENCE
+    # -------------------------------------------------
+    with torch.no_grad():
+        out = model(tensor, num_bones=5)
+        max_pts = out["ppn_coords"].shape[1]
+        nb = max(1, max_pts // 7)
+        out = model(tensor, num_bones=nb)
+
+    # -------------------------------------------------
+    # MASK + COMPONENTS
+    # -------------------------------------------------
+    pmask = out["mask_logits"].sigmoid()[0, 0].cpu().numpy()
+    pmask_big = cv2.resize(pmask, (1024,1024), interpolation=cv2.INTER_NEAREST)
+
+    bin_mask = (pmask_big > 0.5).astype(np.uint8)
+    num_labels, lab = cv2.connectedComponents(bin_mask)
+
+    comps = []
+    for cid in range(1, num_labels):
+        comp = (lab == cid).astype(np.uint8)
+        if comp.sum() >= MIN_COMP_AREA:
+            comps.append(comp)
+
+    # -------------------------------------------------
+    # OR calculation + SAVE OR IMAGE
+    # -------------------------------------------------
+    or_img_path = None
+    if save_images:
+        or_img_path = f"{subject}_frame_{frame_idx}_or.png"
+
+    or_res = compute_OR_from_components(
+        comps=comps,
+        rgb=rgb,
+        out_path=or_img_path
+    )
+
+    # -------------------------------------------------
+    # SAVE DEBUG IMAGE
+    # -------------------------------------------------
+    if save_images:
+        debug_path = f"{subject}_frame_{frame_idx}.png"
+
+        fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+        ax[0].imshow(rgb, cmap="gray")
+        ax[0].set_title("Input Frame")
+
+        ax[1].imshow(pmask_big, cmap="gray")
+        ax[1].set_title("Predicted Mask")
+
+        for a in ax:
+            a.axis("off")
+
+        plt.savefig(debug_path, dpi=150)
+        plt.close()
+
+        print(f"[SAVED] {debug_path}")
+        if or_img_path:
+            print(f"[SAVED] {or_img_path}")
+
+    or_res["bone_count"] = len(comps)
+    return or_res
 
 # -------------------------------------------------
 # MAIN
 # -------------------------------------------------
 if __name__ == "__main__":
-    DICOM_PATH = "/home/ds/Desktop/Hand_dicom/K04.dcm"
-    FRAME     =  67
+    DICOM_PATH = "/home/ds/Desktop/Hand_dicom/K02.dcm"
+    FRAME     =  78
 
     model = load_model()
     run_inference(model, DICOM_PATH, FRAME, save_images=True)
